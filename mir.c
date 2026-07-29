@@ -3543,6 +3543,27 @@ static void make_one_ret (MIR_context_t ctx, MIR_item_t func_item) {
   last_ret_insn = VARR_LAST (MIR_insn_t, ret_insns);
   VARR_TRUNC (MIR_op_t, ret_ops, 0);
   if (VARR_LENGTH (MIR_insn_t, ret_insns) > 1) {
+    /* Materialize a fresh temp per result slot and make the last ret return
+       the temps.  The merge below uses ret_ops as the per-slot targets that
+       every other ret's values are moved into, so each slot's target must be a
+       DISTINCT register.  Using the last ret's own operands breaks when they
+       repeat: simplify canonicalizes identical constants to one temp, so a
+       trailing `ret 0, 0` (c2mir emits one after a returning if/else) becomes
+       `ret t, t` -- and both of another ret's distinct values were then moved
+       into the same t, returning { second-word, second-word } for a two-word
+       struct.
+
+       The movs belong to the fall-through (original last-ret) path only, so
+       they are inserted BEFORE the shared label -- a ret that jumps here has
+       already written the temps and must not re-clobber them. */
+    for (i = 0; i < func->nres; i++) {
+      mov_code = get_type_move_code (res_types[i]);
+      ret_reg = _MIR_new_temp_reg (ctx, mov_code == MIR_MOV ? MIR_T_I64 : res_types[i], func);
+      ret_reg_op = MIR_new_reg_op (ctx, ret_reg);
+      MIR_insert_insn_before (ctx, func_item, last_ret_insn,
+                              MIR_new_insn (ctx, mov_code, ret_reg_op, last_ret_insn->ops[i]));
+      last_ret_insn->ops[i] = ret_reg_op;
+    }
     ret_label = MIR_new_label (ctx);
     MIR_insert_insn_before (ctx, func_item, last_ret_insn, ret_label);
   }
