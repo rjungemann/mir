@@ -4727,7 +4727,10 @@ D (spec_qual_list) {
 
   list = new_node (c2m_ctx, N_LIST);
   for (first_p = TRUE;; first_p = FALSE) {
-    if (C (T_CONST) || C (T_RESTRICT) || C (T_VOLATILE) || C (T_ATOMIC)) {
+    if (C (T_ALIGNAS)) { /* C23 / gcc+clang: alignment-specifier in a member decl */
+      P (align_spec);
+      op = r;
+    } else if (C (T_CONST) || C (T_RESTRICT) || C (T_VOLATILE) || C (T_ATOMIC)) {
       P (type_qual);
       op = r;
     } else if ((op = TRY_A (type_spec, arg)) != err_node) {
@@ -6115,6 +6118,7 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
               && expr->c.u_val == 0)
             continue;
           member_align = type_align (decl->decl_spec.type);
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
           if (align < member_align) align = member_align;
         }
     }
@@ -6274,6 +6278,7 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
             continue;
           }
           member_align = type_align (decl->decl_spec.type);
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
           bits
             = width->code == N_IGNORE || !(expr = width->attr)->const_p ? -1 : (int) expr->c.u_val;
           update_field_layout (&bf_p, &overall_size, &offset, &bound_bit, prev_size, member_size,
