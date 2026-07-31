@@ -619,6 +619,12 @@ struct node {
   node_code_t code;
   unsigned uid;
   int pack; /* #pragma pack in effect for N_STRUCT/N_UNION (0 = none) */
+  /* C23 enum with a fixed underlying type (`enum E : uint64_t`): the
+     spec-qual-list after the ':', for N_ENUM only.  Deliberately NOT an operand
+     of the node -- keeping it out of u.ops means no generic op walker sees it
+     and the N_ENUM arity the rest of the file assumes is unchanged; the checker
+     resolves it explicitly. */
+  node_t enum_base;
   void *attr; /* used a scope for parser and as an attribute after */
   DLIST_LINK (node_t) op_link;
   union {
@@ -695,6 +701,7 @@ static node_t new_node (c2m_ctx_t c2m_ctx, node_code_t nc) {
   n->code = nc;
   n->uid = curr_uid++;
   n->pack = 0;
+  n->enum_base = NULL;
   DLIST_INIT (node_t, n->u.ops);
   n->attr = NULL;
   set_node_pos (c2m_ctx, n, no_pos);
@@ -4721,10 +4728,22 @@ DA (type_spec) {
     r = new_pos_node2 (c2m_ctx, struct_p ? N_STRUCT : N_UNION, pos, op1, r);
     r->pack = tok_pack; /* #pragma pack in effect at the declaration */
   } else if (MP (T_ENUM, pos)) { /* enum-specifier */
+    node_t enum_base = NULL;
+
     if (!MN (T_ID, op1)) {
       op1 = new_node (c2m_ctx, N_IGNORE);
     } else {
       id_p = TRUE;
+    }
+    /* C23 enum-type-specifier: `enum [tag] : specifier-qualifier-list`.  The
+       Darwin SDK reaches this through malloc/malloc.h:96
+       (`typedef enum __enum_options : uint64_t {...}`, where __enum_options
+       expands to nothing for a compiler that does not advertise the
+       __flag_enum__ attribute). */
+    if (M (':')) {
+      P (spec_qual_list);
+      enum_base = r;
+      if (!C ('{') && !id_p) return err_node;
     }
     op2 = new_node (c2m_ctx, N_LIST);
     if (M ('{')) { /* enumerator-list */
@@ -4748,6 +4767,7 @@ DA (type_spec) {
       op2 = new_node (c2m_ctx, N_IGNORE);
     }
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
+    r->enum_base = enum_base;
   } else if (arg == NULL) {
     P (typedef_name);
   } else {
@@ -6939,15 +6959,40 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       node_t res_tag_type, id = NL_HEAD (n->u.ops);
       node_t enum_list = NL_NEXT (id);
       node_t enum_const_scope = skip_struct_scopes (curr_scope);
+      /* C23 fixed underlying type, TP_UNDEF when the enum does not name one. */
+      enum basic_type fixed_basic_type = TP_UNDEF;
 
+      if (n->enum_base != NULL) {
+        struct decl_spec base_spec = check_decl_spec (c2m_ctx, n->enum_base, n);
+
+        if (base_spec.type == NULL || base_spec.type->mode != TM_BASIC
+            || !integer_type_p (base_spec.type)) {
+          error (c2m_ctx, POS (n), "enum underlying type is not an integer type");
+        } else {
+          fixed_basic_type = base_spec.type->u.basic_type;
+        }
+      }
       set_type_pos_node (type, n);
       res_tag_type = process_tag (c2m_ctx, n, id, enum_list);
       check_type_duplication (c2m_ctx, type, n, "enum", size, sign);
       type->mode = TM_ENUM;
       type->u.tag_type = res_tag_type;
       if (enum_list->code == N_IGNORE) {
-        if (incomplete_type_p (c2m_ctx, type))
+        /* C23: `enum E : T;` has a known storage size even with no enumerator
+           list, so it is a complete type -- attach the enum_type here rather
+           than reporting an unknown size. */
+        if (fixed_basic_type != TP_UNDEF) {
+          if (n->attr == NULL) {
+            struct enum_type *enum_type;
+
+            n->attr = enum_type = reg_malloc (c2m_ctx, sizeof (struct enum_type));
+            enum_type->enum_basic_type = fixed_basic_type;
+          }
+          if (res_tag_type != n && res_tag_type->attr == NULL)
+            res_tag_type->attr = n->attr;
+        } else if (incomplete_type_p (c2m_ctx, type)) {
           error (c2m_ctx, POS (n), "enum storage size is unknown");
+        }
       } else {
         mir_llong curr_val = -1, min_val = 0;
         mir_ullong max_val = 0;
@@ -6955,7 +7000,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         int neg_p = FALSE;
 
         n->attr = enum_type = reg_malloc (c2m_ctx, sizeof (struct enum_type));
-        enum_type->enum_basic_type = TP_INT;                                           // ???
+        enum_type->enum_basic_type = fixed_basic_type != TP_UNDEF ? fixed_basic_type : TP_INT;
         for (node_t en = NL_HEAD (enum_list->u.ops); en != NULL; en = NL_NEXT (en)) {  // ??? id
           node_t const_expr;
           symbol_t sym;
@@ -7003,13 +7048,19 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
             }
             enum_value->u.i_val = curr_val;
           }
-          enum_type->enum_basic_type
-            = (max_val <= MIR_INT_MAX && MIR_INT_MIN <= min_val     ? TP_INT
-               : max_val <= MIR_UINT_MAX && 0 <= min_val            ? TP_UINT
-               : max_val <= MIR_LONG_MAX && MIR_LONG_MIN <= min_val ? TP_LONG
-               : max_val <= MIR_ULONG_MAX && 0 <= min_val           ? TP_ULONG
-               : min_val < 0 || max_val <= MIR_LLONG_MAX            ? TP_LLONG
-                                                                    : TP_ULLONG);
+          /* C23: a fixed underlying type IS the enum's type -- it is not
+             widened or narrowed to fit the enumerators.  Only infer when the
+             declaration did not name one. */
+          if (fixed_basic_type != TP_UNDEF)
+            enum_type->enum_basic_type = fixed_basic_type;
+          else
+            enum_type->enum_basic_type
+              = (max_val <= MIR_INT_MAX && MIR_INT_MIN <= min_val     ? TP_INT
+                 : max_val <= MIR_UINT_MAX && 0 <= min_val            ? TP_UINT
+                 : max_val <= MIR_LONG_MAX && MIR_LONG_MIN <= min_val ? TP_LONG
+                 : max_val <= MIR_ULONG_MAX && 0 <= min_val           ? TP_ULONG
+                 : min_val < 0 || max_val <= MIR_LLONG_MAX            ? TP_LLONG
+                                                                      : TP_ULLONG);
         }
       }
       break;
