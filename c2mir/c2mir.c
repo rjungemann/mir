@@ -4804,6 +4804,13 @@ D (struct_declaration) {
   if (C (T_STATIC_ASSERT)) {
     P (st_assert);
   } else {
+    /* A member declaration may LEAD with a GCC attribute, exactly as an
+       ordinary declaration may -- `declaration` already swallows one here.
+       <dirent.h>:84 is `__unused long __padding;`, and sys/cdefs.h:172 defines
+       __unused unconditionally as __attribute__((__unused__)), so without this
+       the whole DIR struct fails to parse and every later use of a `DIR *`
+       reports an undeclared identifier. */
+    try_attr_spec (c2m_ctx, curr_token->pos, NULL);
     P (spec_qual_list);
     spec = r;
     list = new_node (c2m_ctx, N_LIST);
