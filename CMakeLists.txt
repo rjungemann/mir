@@ -41,7 +41,13 @@ message("C compiler flags: ${CMAKE_C_FLAGS}")
 option(BUILD_TESTING "" ON)
 include(CTest)
 
-add_library(mir OBJECT mir.c mir-gen.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
+# WebAssembly cannot generate code at runtime, so the JIT generator is not
+# built there and MIR is limited to interpreter mode.
+if(EMSCRIPTEN)
+  add_library(mir OBJECT mir.c c2mir/c2mir.c mir.h c2mir/c2mir.h)
+else()
+  add_library(mir OBJECT mir.c mir-gen.c c2mir/c2mir.c mir.h mir-gen.h c2mir/c2mir.h)
+endif()
 target_include_directories(mir PRIVATE ${PROJECT_SOURCE_DIR})
 if(Threads_FOUND)
   target_compile_definitions(mir PUBLIC "MIR_PARALLEL_GEN")
@@ -53,6 +59,11 @@ endif()
 # ------------------ LIBMIR -----------------------
 add_library(mir_static STATIC)
 target_link_libraries(mir_static PRIVATE mir)
+
+# Everything below needs the code generator and/or a native executable
+# format, neither of which exists on a wasm target.  A wasm consumer links
+# mir_static into its own Emscripten build.
+if(NOT EMSCRIPTEN)
 
 # ------------------ LIBMIR SO --------------------
 add_library(mir_shared SHARED)
@@ -247,4 +258,6 @@ add_test(mir2c-test mir2c_test)
 # ------------------ c2m tests --------------------------
 
 add_test(c2mir-simple-test c2m -v ${PROJECT_SOURCE_DIR}/sieve.c -ei)
+
+endif() # NOT EMSCRIPTEN
 

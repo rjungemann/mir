@@ -728,7 +728,11 @@ static void hard_reg_name_init (MIR_context_t ctx);
 static void hard_reg_name_finish (MIR_context_t ctx);
 
 #include "mir-alloc-default.c"
+#if defined(__wasm32__) || defined(__EMSCRIPTEN__)
+#include "mir-code-alloc-wasm.c"
+#else
 #include "mir-code-alloc-default.c"
+#endif
 
 MIR_context_t _MIR_init (MIR_alloc_t alloc, MIR_code_alloc_t code_alloc) {
   MIR_context_t ctx;
@@ -4403,8 +4407,10 @@ static code_holder_t *get_last_code_holder (MIR_context_t ctx, size_t size) {
   return VARR_ADDR (code_holder_t, code_holders) + len - 1;
 }
 
-void _MIR_flush_code_cache (void *start, void *bound) {
-#if defined(__GNUC__) && !defined(__MIRC__)
+void _MIR_flush_code_cache (void *start MIR_UNUSED, void *bound MIR_UNUSED) {
+/* wasm has no instruction cache to flush and llvm.clear_cache is not
+   supported there, so the builtin must not be emitted. */
+#if defined(__GNUC__) && !defined(__MIRC__) && !defined(__wasm32__) && !defined(__EMSCRIPTEN__)
   __builtin___clear_cache (start, bound);
 #endif
 }
@@ -6954,6 +6960,8 @@ void _MIR_dump_code (const char *name, uint8_t *code, size_t code_len) {
 #error "RISCV 128-bit floats (Q set) is not supported"
 #endif
 #include "mir-riscv64.c"
+#elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
+#include "mir-wasm.c"
 #else
 #error "undefined or unsupported generation target"
 #endif

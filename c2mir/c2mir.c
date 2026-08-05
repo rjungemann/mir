@@ -38,6 +38,8 @@
 #include "s390x/cs390x.h"
 #elif defined(__riscv)
 #include "riscv64/criscv64.h"
+#elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
+#include "wasm32/cwasm32.h"
 #else
 #error "undefined or unsupported generation target for C"
 #endif
@@ -344,6 +346,8 @@ typedef struct {
 #include "s390x/cs390x-code.c"
 #elif defined(__riscv)
 #include "riscv64/criscv64-code.c"
+#elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
+#include "wasm32/cwasm32-code.c"
 #else
 #error "undefined or unsupported generation target for C"
 #endif
@@ -11388,6 +11392,8 @@ static inline void MIR_UNUSED gen_multiple_load_store (c2m_ctx_t c2m_ctx, struct
 #include "s390x/cs390x-ABI-code.c"
 #elif defined(__riscv)
 #include "riscv64/criscv64-ABI-code.c"
+#elif defined(__wasm32__) || defined(__EMSCRIPTEN__)
+#include "wasm32/cwasm32-ABI-code.c"
 #else
 typedef int target_arg_info_t; /* whatever */
 /* Initiate ARG_INFO for generating call, prototype, or prologue. */
