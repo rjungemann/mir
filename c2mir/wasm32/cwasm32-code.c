@@ -10,10 +10,24 @@
 #include "mirc_wasm32_stdarg.h"
 #include "mirc_wasm32_stdint.h"
 #include "mirc_wasm32_stddef.h"
-#include "mirc_wasm32_libc.h"
 
+/* Only compiler-provided headers, as on every other target.
+ *
+ * This target used to also ship minimal stdio/stdlib/string/math here, because
+ * a browser has no filesystem to read the real ones from.  That put the
+ * declarations in the compiler and the matching symbol table in the embedder --
+ * two different repositories -- and they drifted: the headers ended up
+ * declaring roughly twice as many functions as the embedder actually supplied,
+ * so calls to the rest compiled cleanly and then failed at link.
+ *
+ * An embedder needing libc declarations should serve them through
+ * c2mir_options.include_dirs instead (Emscripten's MEMFS is readable by the
+ * ordinary fopen-based include search) and generate them from the same list it
+ * registers with MIR_load_external.  Note that standard_includes is consulted
+ * *before* system_header_dirs, so anything named here would shadow the
+ * embedder's copy. */
 static string_include_t standard_includes[]
-  = {{NULL, mirc}, {NULL, wasm32_mirc}, TARGET_STD_INCLUDES, WASM32_LIBC_INCLUDES};
+  = {{NULL, mirc}, {NULL, wasm32_mirc}, TARGET_STD_INCLUDES};
 
 #define MAX_ALIGNMENT 8
 

@@ -9234,6 +9234,13 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       va_arg_p = str_eq_p (op1->u.s.s, BUILTIN_VA_ARG);
       va_start_p = str_eq_p (op1->u.s.s, BUILTIN_VA_START);
       if (!va_arg_p && !va_start_p && !alloca_p) {
+        /* C99 removed implicit function declarations, and here the consequence
+           is worse than a portability nit: the type synthesised below takes no
+           arguments, so the call is generated against a no-argument prototype
+           and passes garbage instead of the caller's arguments -- silently, and
+           with no diagnostic before this one. */
+        warning (c2m_ctx, POS (op1), "%s implicitly declared as a function returning int",
+                 op1->u.s.s);
         /* N_SPEC_DECL (N_SHARE (N_LIST (N_INT)), N_DECL (N_ID, N_FUNC (N_LIST)), N_IGNORE,
            N_IGNORE, N_IGNORE) */
         spec_list = new_node (c2m_ctx, N_LIST);
