@@ -13011,9 +13011,27 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           t = get_mir_type (c2m_ctx, arg_type);
           t = promote_mir_int_type (t);
           op2 = promote (c2m_ctx, op2, t, FALSE);
-        } else {
+        } else { /* past the declared parameters: a variadic argument */
           t = get_mir_type (c2m_ctx, e->type);
           t = promote_mir_int_type (t);
+#if defined(__wasm32__) || defined(__EMSCRIPTEN__)
+          /* This is the last place the argument's real C width is known.
+             mir-interp.c derives variadic argument types from an operand's
+             value_mode, which distinguishes only int/uint/float/double, so
+             every integer reaches _MIR_get_ff_call as MIR_T_I64 and the
+             Emscripten vararg buffer is laid out in 4-byte slots -- right for
+             %d/%c/%s/%p, silently truncating for a genuine long long.
+
+             Refusing is not the fix; the fix is for this target to build the
+             vararg buffer here, where these types are still known, and lower
+             the call to a non-variadic one taking a pointer (which is what
+             Emscripten's own clang does). Until then, say so rather than
+             printing a plausible wrong number. */
+          if (t == MIR_T_I64 || t == MIR_T_U64)
+            error (c2m_ctx, POS (arg),
+                   "wasm32: 64-bit integer as a variadic argument is not supported"
+                   " (the value would be silently truncated)");
+#endif
           op2 = promote (c2m_ctx, op2, t == MIR_T_F ? MIR_T_D : t, FALSE);
         }
         target_add_call_arg_op (c2m_ctx, arg_type, &arg_info, op2);
