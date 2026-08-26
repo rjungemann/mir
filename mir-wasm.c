@@ -157,6 +157,7 @@ typedef struct {
   void *target;        /* WASM_THUNK_NATIVE */
   MIR_context_t ctx;   /* WASM_THUNK_INTERP */
   MIR_item_t func_item;
+  uint32_t fn_ptr;     /* lazily created wasm table entry; 0 = none yet */
 } wasm_thunk_t;
 
 static wasm_thunk_t wasm_thunks[WASM_MAX_THUNKS];
@@ -174,6 +175,7 @@ static wasm_thunk_t *wasm_thunk_alloc (MIR_context_t ctx) {
   t->target = NULL;
   t->ctx = ctx; /* kept even for a native redirect, so errors have a context */
   t->func_item = NULL;
+  t->fn_ptr = 0;
   return t;
 }
 
@@ -188,6 +190,122 @@ static wasm_thunk_t *wasm_thunk_of (void *addr) {
   off = (size_t) ((char *) addr - (char *) wasm_thunks);
   if (off % sizeof (wasm_thunk_t) != 0) return NULL; /* interior pointer: not a thunk */
   return (wasm_thunk_t *) addr;
+}
+
+/* ---------------------------------------------------------------- */
+/* Interpreted functions as real wasm function pointers              */
+/* ---------------------------------------------------------------- */
+
+/* A thunk is a table slot, which is all interpreted->interpreted calls need,
+   but it is not something a *native* callee can call: qsort does a genuine
+   call_indirect on whatever pointer it was handed.  So when an interpreted
+   function's address is about to cross into native code, give it a real entry
+   in the wasm table that trampolines back into the interpreter.
+
+   Created on demand and cached, because most functions never escape and each
+   entry costs a table slot and a JS closure. */
+
+/* How an argument has to be widened into its 8-byte MIR_val_t slot.  The wasm
+   signature cannot express this: it only says i32, while the interpreter reads
+   a full 64-bit field and would see garbage in the high half. */
+static char wasm_marshal_code (MIR_type_t t) {
+  switch (t) {
+  case MIR_T_I8:
+  case MIR_T_I16:
+  case MIR_T_I32: return 'i'; /* sign-extend */
+  case MIR_T_U8:
+  case MIR_T_U16:
+  case MIR_T_U32:
+  case MIR_T_P: return 'u'; /* zero-extend */
+  case MIR_T_I64:
+  case MIR_T_U64: return 'j';
+  case MIR_T_F: return 'f';
+  case MIR_T_D:
+  case MIR_T_LD: return 'd';
+  default: return 'u';
+  }
+}
+
+/* Called from the JS trampoline below with a buffer laid out the way
+   wasm_ff_dispatch lays one out: results first, then arguments. */
+EMSCRIPTEN_KEEPALIVE void mir_wasm_interp_entry (uint32_t slot, MIR_val_t *ras) {
+  wasm_thunk_t *t;
+  MIR_func_t func;
+
+  if (slot >= wasm_thunks_num) return;
+  t = &wasm_thunks[slot];
+  if (t->kind != WASM_THUNK_INTERP) return;
+  func = t->func_item->u.func;
+  MIR_interp_arr (t->ctx, t->func_item, ras, func->nargs, ras + func->nres);
+}
+
+/* WSIG is the wasm signature addFunction needs (result first).  MSIG says how
+   to widen each argument.  STRIDE is sizeof (MIR_val_t), which is *not* 8: the
+   union carries a host long double, and Emscripten's is 128-bit, so the slots
+   are 16 bytes apart.  Getting that wrong reads every argument one slot low.
+
+   The buffer is stack-allocated per call, so a comparator invoked repeatedly --
+   or recursively -- never shares it. */
+EM_JS (int, mir_wasm_add_interp_entry,
+       (uint32_t slot, const char *wsig, const char *msig, uint32_t nres, uint32_t stride), {
+         var ws = UTF8ToString (wsig), ms = UTF8ToString (msig);
+         var f = function () {
+           var sp = stackSave ();
+           try {
+             var n = arguments.length, i, off;
+             var buf = stackAlloc ((nres + n) * stride);
+             for (i = 0; i < ((nres + n) * stride) >> 3; i++) HEAP64[(buf >> 3) + i] = 0n;
+             for (i = 0; i < n; i++) {
+               off = buf + (nres + i) * stride;
+               switch (ms.charCodeAt (i)) {
+               case 106: HEAP64[off >> 3] = arguments[i]; break;                /* j */
+               case 102: HEAPF32[off >> 2] = arguments[i]; break;               /* f */
+               case 100: HEAPF64[off >> 3] = arguments[i]; break;               /* d */
+               case 117: HEAP64[off >> 3] = BigInt (arguments[i] >>> 0); break; /* u */
+               default: HEAP64[off >> 3] = BigInt (arguments[i] | 0); break;    /* i */
+               }
+             }
+             _mir_wasm_interp_entry (slot, buf);
+             if (nres == 0) return;
+             switch (ws.charCodeAt (0)) {
+             case 106: return HEAP64[buf >> 3];
+             case 102: return HEAPF32[buf >> 2];
+             case 100: return HEAPF64[buf >> 3];
+             default: return HEAP32[buf >> 2];
+             }
+           } finally {
+             stackRestore (sp);
+           }
+         };
+         return addFunction (f, ws);
+       });
+
+static uint32_t wasm_thunk_fn_ptr (wasm_thunk_t *t) {
+  char wsig[WASM_FF_MAX_ARGS + 2], msig[WASM_FF_MAX_ARGS + 1];
+  MIR_func_t func;
+  MIR_var_t *vars;
+  size_t i, n;
+
+  if (t->fn_ptr != 0) return t->fn_ptr;
+  func = t->func_item->u.func;
+  n = func->nargs;
+  if (func->vararg_p || func->nres > 1 || n > WASM_FF_MAX_ARGS) {
+    MIR_get_error_func (t->ctx) (MIR_call_op_error,
+                                 "wasm32: cannot pass %s to native code as a function pointer",
+                                 func->name);
+    return 0;
+  }
+  wsig[0] = func->nres == 0 ? WASM_TC_VOID : wasm_type_code (func->res_types[0]);
+  vars = VARR_ADDR (MIR_var_t, func->vars);
+  for (i = 0; i < n; i++) {
+    wsig[i + 1] = wasm_type_code (vars[i].type);
+    msig[i] = wasm_marshal_code (vars[i].type);
+  }
+  wsig[n + 1] = msig[n] = '\0';
+  t->fn_ptr = (uint32_t) mir_wasm_add_interp_entry ((uint32_t) (t - wasm_thunks), wsig, msig,
+                                                    (uint32_t) func->nres,
+                                                    (uint32_t) sizeof (MIR_val_t));
+  return t->fn_ptr;
 }
 
 static void wasm_ff_dispatch (int sig_index, void *addr, void *res_and_args) {
@@ -241,13 +359,14 @@ static void wasm_ff_dispatch (int sig_index, void *addr, void *res_and_args) {
       /* Variadic tail goes into a buffer, not into registers.  Emscripten
          lowers f(fixed..., ...) to f(fixed..., void *va_buf).
 
-         NOTE: mir-interp.c widens every variadic integer argument to
-         MIR_T_I64 before we see it, so the original C width is lost here.
-         We lay integers out as 4-byte int/pointer slots, which is what
-         %d/%c/%s/%p need.  A genuine `long long` (%lld) would need 8 and
-         is therefore not supported yet -- fixing it properly means having
-         the c2mir wasm32 target build the buffer, where the real C types
-         are still known. */
+         c2mir no longer reaches this path: its wasm32 target builds the
+         buffer itself at the call site (VA_BUF_TARGET_P) and emits a
+         non-variadic call, precisely because the widths are still known
+         there and are not recoverable here -- mir-interp.c widens every
+         variadic integer to MIR_T_I64 before we see it, so `long long`
+         cannot be told from `int`.  What follows is the best guess for any
+         other producer of vararg MIR calls: 4-byte integer slots, which is
+         right for %d/%c/%s/%p and truncates a genuine long long. */
       if (wasm_type_code (t) == WASM_TC_F64 || wasm_type_code (t) == WASM_TC_F32) {
         double d = (t == MIR_T_F) ? (double) args[i].f : args[i].d;
         va_off = (va_off + 7) & ~(size_t) 7;
@@ -269,6 +388,16 @@ static void wasm_ff_dispatch (int sig_index, void *addr, void *res_and_args) {
     switch (codes[ncall]) {
     case WASM_TC_I32: {
       uint32_t v = (uint32_t) args[i].u;
+      /* An interpreted function's address crossing into native code: hand over
+         a real table entry instead of the thunk slot, which is not callable.
+         wasm32 is ILP32, so a pointer and an int are the same wasm type and a
+         plain integer that happens to equal a live thunk's address would be
+         substituted too -- it has to be slot-aligned, in range, and an
+         interpreted thunk, which makes that vanishingly unlikely. */
+      wasm_thunk_t *arg_thunk = wasm_thunk_of ((void *) (uintptr_t) v);
+
+      if (arg_thunk != NULL && arg_thunk->kind == WASM_THUNK_INTERP)
+        v = wasm_thunk_fn_ptr (arg_thunk);
       memcpy (slot, &v, 4);
       break;
     }

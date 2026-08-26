@@ -97,18 +97,21 @@ calls in a loop.
   properly means having the c2mir wasm32 target build the variadic buffer,
   where the real C types are still known. `wasm-tests/ffi-test.c` has a
   test marked `KNOWN-BROKEN` that fails on exactly this.
-- **Native code cannot call back into interpreted functions.** A thunk here
-  is a slot in a table (`mir-wasm.c`), not a wasm function pointer, so a
-  native callee cannot call one through `wasmTable`. Passing an interpreted
-  comparator to `qsort` will not work. Fixing it needs Emscripten's
-  `addFunction` to append a real table entry at runtime.
+- Native code *can* now call back into interpreted functions: when an
+  interpreted function's address is about to be handed to a native callee,
+  `wasm_ff_dispatch` swaps in a real wasm table entry created with
+  Emscripten's `addFunction`. `qsort` and `bsearch` with an interpreted
+  comparator work, including a comparator that itself calls interpreted or
+  native code. Requires `-sALLOW_TABLE_GROWTH` and the `addFunction`,
+  `stackAlloc`, `stackSave` and `stackRestore` runtime methods.
 
-  Note this is now only about *native* callees. Interpreted code calling
-  interpreted code works: `_MIR_get_thunk` used to return one shared
-  do-nothing stub for every function and `_MIR_redirect_thunk` was inert, so
-  such calls invoked an empty stub and silently produced 0. That was masked
-  for shallow calls by MIR's inliner, and surfaced as recursion returning
-  wrong answers past roughly 15 frames — where the inliner gives up.
+  Two things to know if you touch that code. `sizeof (MIR_val_t)` is **16**
+  here, not 8 — the union carries a host `long double` and Emscripten's is
+  128-bit — so the marshalling buffer's stride has to come from `sizeof`
+  rather than being assumed. And wasm32 is ILP32, so a function pointer and
+  an `int` are the same wasm type; the substitution therefore triggers on any
+  i32 argument that happens to be a live, slot-aligned interpreted thunk
+  address, which is vanishingly unlikely but not impossible.
 - **Calling an interpreted variadic function from interpreted code** raises
   an explicit error rather than returning garbage.
 - `long double` precision is that of `double`, so `%Lf` is not usable.
