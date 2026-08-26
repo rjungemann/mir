@@ -286,7 +286,19 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
 #if defined(__APPLE__)                              /* all varargs are passed on stack */
     if (i - start == nargs) int_arg_num = fp_arg_num = 8;
 #endif
-    if (MIR_blk_type_p (type) && (qwords = (call_insn->ops[i].u.var_mem.disp + 7) / 8) <= 2) {
+    if (hfa_blk_type_p (type)) {
+      /* Must mirror the HFA arm of the lowering loop below exactly -- this
+         pass sizes the outgoing area, and a disagreement mis-sizes the frame. */
+      int nmemb = (int) call_insn->ops[i].u.var_mem.disp / hfa_member_size (type);
+
+      if (fp_arg_num + (size_t) nmemb <= 8) {
+        fp_arg_num += nmemb;
+      } else {
+        fp_arg_num = 8;
+        blk_offset += (call_insn->ops[i].u.var_mem.disp + 7) / 8 * 8;
+      }
+    } else if (MIR_blk_type_p (type)
+               && (qwords = (call_insn->ops[i].u.var_mem.disp + 7) / 8) <= 2) {
       if (int_arg_num + qwords > 8) blk_offset += qwords * 8;
       int_arg_num += qwords;
     } else if (get_arg_reg (type, &int_arg_num, &fp_arg_num, &new_insn_code) == MIR_NON_VAR) {
@@ -328,6 +340,44 @@ static void machinize_call (gen_ctx_t gen_ctx, MIR_insn_t call_insn) {
       gen_mov (gen_ctx, call_insn, MIR_MOV, arg_reg_op,
                _MIR_new_var_op (ctx, arg_op.u.var_mem.base));
       call_insn->ops[i] = arg_reg_op;
+      continue;
+    } else if (hfa_blk_type_p (type)) {
+      /* AAPCS64 HFA: one member per v register.  All-or-nothing -- if the
+         members do not all fit in the remaining v0..v7, the whole aggregate
+         goes on the stack and NSRN is set to 8 so a later, smaller HFA cannot
+         backfill the registers this one skipped.  (On Apple targets a vararg
+         has already had fp_arg_num forced to 8 above, so varargs take the
+         stack arm here, which is what that ABI wants.) */
+      MIR_type_t mov_type = hfa_member_mir_type (type);
+      int msize = hfa_member_size (type);
+      int nmemb = (int) arg_op.u.var_mem.disp / msize;
+
+      gen_assert (nmemb >= 1 && nmemb <= 4);
+      if (fp_arg_num + (size_t) nmemb <= 8) {
+        for (int k = 0; k < nmemb; k++) {
+          MIR_insn_code_t mov_code;
+          MIR_reg_t reg = get_arg_reg (mov_type, &int_arg_num, &fp_arg_num, &mov_code);
+
+          new_insn = MIR_new_insn (ctx, mov_code, _MIR_new_var_op (ctx, reg),
+                                   _MIR_new_var_mem_op (ctx, mov_type, k * msize,
+                                                        arg_op.u.var_mem.base, MIR_NON_VAR, 1));
+          gen_add_insn_before (gen_ctx, call_insn, new_insn);
+          /* Registers the hard reg as an argument of this call so the
+             allocator keeps it live; unlike the base/index trick the plain
+             BLK path uses, this has no two-register limit. */
+          setup_call_hard_reg_args (gen_ctx, call_insn, reg);
+        }
+        call_insn->ops[i].u.var_mem.base = MIR_NON_VAR; /* not used anymore */
+        continue;
+      }
+      fp_arg_num = 8; /* no backfill after an HFA goes to the stack */
+      qwords = (arg_op.u.var_mem.disp + 7) / 8;
+      gen_blk_mov (gen_ctx, call_insn, mem_size, SP_HARD_REG, 0, arg_op.u.var_mem.base, qwords,
+                   int_arg_num);
+      call_insn->ops[i]
+        = _MIR_new_var_mem_op (ctx, MIR_T_UNDEF, mem_size, SP_HARD_REG, MIR_NON_VAR, 1);
+      mem_size += qwords * 8;
+      blk_offset += qwords * 8;
       continue;
     } else if (MIR_blk_type_p (type)) {
       qwords = (arg_op.u.var_mem.disp + 7) / 8;
@@ -783,6 +833,42 @@ static void target_machinize (gen_ctx_t gen_ctx) {
     if (type == MIR_T_RBLK && i == 0) { /* hidden arg */
       arg_reg_op = _MIR_new_var_op (ctx, R8_HARD_REG);
       gen_mov (gen_ctx, anchor, MIR_MOV, _MIR_new_var_op (ctx, i + MAX_HARD_REG + 1), arg_reg_op);
+      continue;
+    } else if (hfa_blk_type_p (type)) {
+      /* Mirror of the call-side HFA lowering: spill v0..v7 members into a
+         local save area and point the parameter at it.  The register
+         assignment here must match what a caller does member for member. */
+      MIR_type_t mov_type = hfa_member_mir_type (type);
+      int msize = hfa_member_size (type);
+      int nmemb = (int) var.size / msize;
+
+      gen_assert (nmemb >= 1 && nmemb <= 4);
+      if (fp_arg_num + (size_t) nmemb <= 8) {
+        small_aggregate_save_area += (var.size + 7) / 8 * 8;
+        new_insn = MIR_new_insn (ctx, MIR_SUB, _MIR_new_var_op (ctx, i + MAX_HARD_REG + 1),
+                                 _MIR_new_var_op (ctx, FP_HARD_REG),
+                                 MIR_new_int_op (ctx, small_aggregate_save_area));
+        gen_add_insn_before (gen_ctx, anchor, new_insn);
+        for (int k = 0; k < nmemb; k++)
+          gen_mov (gen_ctx, anchor, mov_type == MIR_T_F ? MIR_FMOV : MIR_DMOV,
+                   _MIR_new_var_mem_op (ctx, mov_type, k * msize, i + MAX_HARD_REG + 1,
+                                        MIR_NON_VAR, 1),
+                   _MIR_new_var_op (ctx, V0_HARD_REG + fp_arg_num + k));
+        fp_arg_num += nmemb;
+      } else { /* passed on the stack w/o address -- see the call side */
+        fp_arg_num = 8;
+        if (!block_arg_func_p) {
+          block_arg_func_p = TRUE;
+          gen_mov (gen_ctx, anchor, MIR_MOV, _MIR_new_var_op (ctx, R8_HARD_REG),
+                   _MIR_new_var_mem_op (ctx, MIR_T_I64, 16, FP_HARD_REG, MIR_NON_VAR, 1));
+        }
+        gen_add_insn_before (gen_ctx, anchor,
+                             MIR_new_insn (ctx, MIR_ADD,
+                                           _MIR_new_var_op (ctx, i + MAX_HARD_REG + 1),
+                                           _MIR_new_var_op (ctx, R8_HARD_REG),
+                                           MIR_new_int_op (ctx, mem_size)));
+        mem_size += (var.size + 7) / 8 * 8;
+      }
       continue;
     } else if (MIR_blk_type_p (type) && (qwords = (var.size + 7) / 8) <= 2) {
       if (int_arg_num + qwords <= 8) {

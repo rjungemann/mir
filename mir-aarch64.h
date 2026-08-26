@@ -32,6 +32,38 @@ static const char *const target_hard_reg_names[] = {
 
 #define MAX_HARD_REG V31_HARD_REG
 
+/* AAPCS64 Homogeneous Floating-point Aggregates.  A struct/array of 1-4
+   members all of the same fundamental FP type travels in v0..v7, one member
+   per register, never in x0..x7 and never by reference -- four doubles is 32
+   bytes and still goes in v0..v3.
+
+   MIR reserves MIR_BLK_NUM block classes so a target can discriminate
+   aggregates that travel differently; aarch64 used only the plain one, which
+   is why every aggregate went through the general-purpose path.  These two
+   classes carry the HFA cases from c2mir (caarch64-ABI-code.c's
+   target_get_blk_type) through to the generator and the interface thunks.
+
+   The member COUNT is not encoded in the class -- it is recovered as
+   size / HFA_MEMBER_SIZE, which the c2mir classifier guarantees is exact by
+   refusing to classify any aggregate whose size is not n * member size.
+
+   caarch64-ABI-code.c, mir-gen-aarch64.c and mir-aarch64.c must agree on all
+   of this; a disagreement is a silent, data-dependent miscall. */
+#define MIR_T_BLK_HFA_F (MIR_T_BLK + 1) /* HFA of `float`  members */
+#define MIR_T_BLK_HFA_D (MIR_T_BLK + 2) /* HFA of `double` members */
+
+static inline int hfa_blk_type_p (MIR_type_t t) {
+  return t == MIR_T_BLK_HFA_F || t == MIR_T_BLK_HFA_D;
+}
+
+/* Size in bytes of one member of an HFA block class. */
+static inline int hfa_member_size (MIR_type_t t) { return t == MIR_T_BLK_HFA_F ? 4 : 8; }
+
+/* MIR scalar type of one member of an HFA block class. */
+static inline MIR_type_t hfa_member_mir_type (MIR_type_t t) {
+  return t == MIR_T_BLK_HFA_F ? MIR_T_F : MIR_T_D;
+}
+
 /* Hard regs not used in machinized code, preferably call used ones. */
 static const MIR_reg_t TEMP_INT_HARD_REG1 = R9_HARD_REG, TEMP_INT_HARD_REG2 = R10_HARD_REG;
 static const MIR_reg_t TEMP_FLOAT_HARD_REG1 = V16_HARD_REG, TEMP_FLOAT_HARD_REG2 = V17_HARD_REG;
