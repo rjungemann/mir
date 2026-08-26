@@ -121,15 +121,108 @@ EM_JS (void, mir_wasm_js_call,
          }
        });
 
+/* ---------------------------------------------------------------- */
+/* Function thunks                                                   */
+/* ---------------------------------------------------------------- */
+
+/* Every MIR function gets an address from _MIR_get_thunk, and MIR_link then
+   points that address at an interpreter shim (via MIR_set_interp_interface)
+   or at undefined_interface.  On a native target a thunk is a few bytes of
+   patchable machine code and the redirect rewrites a jump; wasm cannot
+   generate code, so a thunk here is a slot in a table and the redirect
+   rewrites the slot.
+
+   Calls out of interpreted code all funnel through wasm_ff_dispatch, which
+   recognises a thunk address and re-enters the interpreter directly rather
+   than trying to call it as a wasm function.
+
+   This is load-bearing for ordinary recursion, not just for exotic cases.
+   While _MIR_get_thunk returned one shared do-nothing stub for every
+   function and _MIR_redirect_thunk was inert, *every* call from interpreted
+   code to another interpreted function invoked that empty stub and silently
+   produced 0.  Shallow calls appeared to work only because MIR's inliner had
+   already replaced them; the bug surfaced as "recursion returns a wrong
+   answer past ~15 frames", which is simply where the inliner gave up. */
+
+#define WASM_MAX_THUNKS 8192
+
+typedef enum {
+  WASM_THUNK_UNSET,
+  WASM_THUNK_NATIVE, /* redirected at a real wasm function pointer */
+  WASM_THUNK_INTERP, /* redirected at an interpreted MIR function */
+} wasm_thunk_kind_t;
+
+typedef struct {
+  wasm_thunk_kind_t kind;
+  void *target;        /* WASM_THUNK_NATIVE */
+  MIR_context_t ctx;   /* WASM_THUNK_INTERP */
+  MIR_item_t func_item;
+} wasm_thunk_t;
+
+static wasm_thunk_t wasm_thunks[WASM_MAX_THUNKS];
+static size_t wasm_thunks_num;
+
+static wasm_thunk_t *wasm_thunk_alloc (MIR_context_t ctx) {
+  wasm_thunk_t *t;
+
+  if (wasm_thunks_num >= WASM_MAX_THUNKS) {
+    MIR_get_error_func (ctx) (MIR_alloc_error, "wasm32: too many function thunks");
+    return NULL;
+  }
+  t = &wasm_thunks[wasm_thunks_num++];
+  t->kind = WASM_THUNK_UNSET;
+  t->target = NULL;
+  t->ctx = ctx; /* kept even for a native redirect, so errors have a context */
+  t->func_item = NULL;
+  return t;
+}
+
+/* NULL unless ADDR is one of ours.  Any other pointer -- a libc function, a
+   symbol from MIR_load_external -- has to fall through to the JS call. */
+static wasm_thunk_t *wasm_thunk_of (void *addr) {
+  size_t off;
+
+  if ((char *) addr < (char *) wasm_thunks
+      || (char *) addr >= (char *) (wasm_thunks + WASM_MAX_THUNKS))
+    return NULL;
+  off = (size_t) ((char *) addr - (char *) wasm_thunks);
+  if (off % sizeof (wasm_thunk_t) != 0) return NULL; /* interior pointer: not a thunk */
+  return (wasm_thunk_t *) addr;
+}
+
 static void wasm_ff_dispatch (int sig_index, void *addr, void *res_and_args) {
   wasm_ff_sig_t *sig = &wasm_ff_sigs[sig_index];
   MIR_val_t *ras = (MIR_val_t *) res_and_args;
   MIR_val_t *args = ras + sig->nres;
+  wasm_thunk_t *thunk = wasm_thunk_of (addr);
   uint8_t slots[WASM_FF_MAX_ARGS * 8];
   char codes[WASM_FF_MAX_ARGS + 1];
   uint8_t va_buf[WASM_FF_VA_BUF_SIZE];
   uint8_t retbuf[8];
   size_t i, ncall = 0, va_off = 0;
+
+  if (thunk != NULL) {
+    if (thunk->kind == WASM_THUNK_INTERP) {
+      /* Straight back into the interpreter.  res_and_args is already in the
+         MIR_val_t layout MIR_interp_arr wants, and it copies the arguments
+         into the callee's frame before writing any result, so results and
+         arguments sharing the buffer is safe. */
+      if (thunk->func_item->u.func->vararg_p) {
+        MIR_get_error_func (thunk->ctx) (MIR_call_op_error,
+                                         "wasm32: calling an interpreted variadic function from "
+                                         "interpreted code is not implemented");
+        return;
+      }
+      MIR_interp_arr (thunk->ctx, thunk->func_item, ras, sig->nargs, args);
+      return;
+    }
+    if (thunk->kind == WASM_THUNK_UNSET || thunk->target == NULL) {
+      MIR_get_error_func (thunk->ctx) (MIR_call_op_error,
+                                       "wasm32: call of an unresolved function");
+      return;
+    }
+    addr = thunk->target;
+  }
 
   memset (slots, 0, sizeof (slots));
   memset (retbuf, 0, sizeof (retbuf));
@@ -300,10 +393,16 @@ void *_MIR_get_ff_call (MIR_context_t ctx, size_t nres, MIR_type_t *res_types, s
 /* Remaining interpreter hooks                                       */
 /* ---------------------------------------------------------------- */
 
-/* These concern native code calling *back into* interpreted functions and
-   runtime-generated thunks.  Implementing them needs Emscripten's
-   addFunction (which appends to the wasm table at runtime); until then
-   they stay inert.  Interpreted code calling out (the REPL case) works. */
+/* _MIR_get_thunk / _MIR_redirect_thunk / _MIR_get_interp_shim are implemented
+   against the thunk table above, which is what makes interpreted code able to
+   call interpreted code.
+
+   _MIR_get_wrapper and the lazy-generation hooks remain inert: those exist for
+   the code generator, which this target does not have.  Handing a *native*
+   callee a pointer to an interpreted function (qsort's comparator, say) is
+   still unsupported -- a thunk is a table slot, not a wasm function pointer,
+   so it cannot be called through wasmTable.  That needs Emscripten's
+   addFunction to append a real table entry at runtime. */
 
 static void *bstart_func (void) {
   static char buf[16];
@@ -347,18 +446,44 @@ void va_start_interp_builtin (MIR_context_t ctx MIR_UNUSED, void *p, void *a) {
 
 void va_end_interp_builtin (MIR_context_t ctx MIR_UNUSED, void *p MIR_UNUSED) {}
 
-static void thunk_func (void) {}
-void *_MIR_get_thunk (MIR_context_t ctx MIR_UNUSED) { return (void *) thunk_func; }
-void *_MIR_get_thunk_addr (MIR_context_t ctx MIR_UNUSED, void *thunk MIR_UNUSED) {
-  return (void *) thunk_func;
-}
-void _MIR_redirect_thunk (MIR_context_t ctx MIR_UNUSED, void *thunk MIR_UNUSED,
-                          void *to MIR_UNUSED) {}
+/* A thunk is a table slot rather than patchable code; see "Function thunks"
+   above.  The pointer handed back is therefore not a callable wasm function
+   pointer -- it is only ever meaningful to wasm_ff_dispatch, which is where
+   every call out of interpreted code goes. */
+void *_MIR_get_thunk (MIR_context_t ctx) { return wasm_thunk_alloc (ctx); }
 
-static void interp_shim_func (void *func MIR_UNUSED, void *args MIR_UNUSED) {}
-void *_MIR_get_interp_shim (MIR_context_t ctx MIR_UNUSED, MIR_item_t func_item MIR_UNUSED,
-                            void *handler MIR_UNUSED) {
-  return (void *) interp_shim_func;
+void *_MIR_get_thunk_addr (MIR_context_t ctx MIR_UNUSED, void *thunk) {
+  wasm_thunk_t *t = wasm_thunk_of (thunk);
+
+  if (t == NULL) return thunk;
+  return t->kind == WASM_THUNK_NATIVE ? t->target : thunk;
+}
+
+void _MIR_redirect_thunk (MIR_context_t ctx MIR_UNUSED, void *thunk, void *to) {
+  wasm_thunk_t *t = wasm_thunk_of (thunk), *src = wasm_thunk_of (to);
+
+  if (t == NULL) return;
+  if (src != NULL) { /* pointing one thunk at another, i.e. at an interp shim */
+    *t = *src;
+  } else {
+    t->kind = WASM_THUNK_NATIVE;
+    t->target = to;
+  }
+}
+
+/* HANDLER is mir-interp.c's static `interp`, which reads its arguments out of
+   a va_list a native shim would have marshalled.  There is no code to
+   generate here, and wasm_ff_dispatch already holds the arguments as
+   MIR_val_t, so it calls the equivalent MIR_interp_arr directly and the
+   handler is not needed. */
+void *_MIR_get_interp_shim (MIR_context_t ctx, MIR_item_t func_item, void *handler MIR_UNUSED) {
+  wasm_thunk_t *t = wasm_thunk_alloc (ctx);
+
+  if (t == NULL) return NULL;
+  t->kind = WASM_THUNK_INTERP;
+  t->ctx = ctx;
+  t->func_item = func_item;
+  return t;
 }
 
 static void wrapper_func (void) {}
