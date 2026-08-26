@@ -13,6 +13,18 @@
 
 #include <stdint.h>
 
+/* Variadic arguments are passed through a buffer the caller builds, the way
+   Emscripten lowers f(fixed..., ...) to f(fixed..., void *va_buf).  c2mir
+   therefore builds that buffer at the call site, where each argument's real C
+   type is still known, and calls the lowered non-variadic signature.
+
+   Doing it any later does not work: mir-interp.c derives variadic argument
+   types from an operand's value_mode, which distinguishes only
+   int/uint/float/double, so every integer would arrive as a 64-bit one and the
+   buffer would be laid out in uniform slots -- right for %d, silently
+   truncating for a genuine long long.  */
+#define VA_BUF_TARGET_P 1
+
 #define MIR_CHAR_BIT 8
 
 typedef int8_t mir_schar;

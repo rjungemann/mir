@@ -44,6 +44,13 @@
 #error "undefined or unsupported generation target for C"
 #endif
 
+/* Targets where the caller builds the variadic-argument buffer; see
+   wasm32/cwasm32.h. Everywhere else the ABI passes variadic arguments the same
+   way as fixed ones and there is nothing to build. */
+#ifndef VA_BUF_TARGET_P
+#define VA_BUF_TARGET_P 0
+#endif
+
 #define SWAP(a1, a2, t) \
   do {                  \
     t = a1;             \
@@ -282,6 +289,10 @@ struct func_type {
   struct type *ret_type;
   node_t param_list; /* w/o N_DOTS */
   MIR_item_t proto_item;
+  /* Targets that pass variadic arguments through a caller-built buffer (see
+     VA_BUF_TARGET_P) also need the lowered signature: the declared parameters
+     plus one pointer, not variadic.  NULL elsewhere. */
+  MIR_item_t va_buf_proto_item;
 };
 
 enum type_mode {
@@ -10206,7 +10217,7 @@ struct gen_ctx {
   VARR (init_el_t) * init_els;
   MIR_item_t memset_proto, memset_item;
   MIR_item_t memcpy_proto, memcpy_item;
-  VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
+  VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops, *va_buf_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
   HTAB (MIR_item_t) * proto_tab;
@@ -10231,6 +10242,7 @@ struct gen_ctx {
 #define memcpy_proto gen_ctx->memcpy_proto
 #define memcpy_item gen_ctx->memcpy_item
 #define call_ops gen_ctx->call_ops
+#define va_buf_ops gen_ctx->va_buf_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
 #define switch_cases gen_ctx->switch_cases
@@ -10536,6 +10548,15 @@ static int push_const_val (c2m_ctx_t c2m_ctx, node_t r, op_t *res) {
 
 static MIR_insn_code_t tp_mov (MIR_type_t t) {
   return t == MIR_T_F ? MIR_FMOV : t == MIR_T_D ? MIR_DMOV : t == MIR_T_LD ? MIR_LDMOV : MIR_MOV;
+}
+
+/* Size and alignment of one slot in a caller-built variadic buffer, for an
+   argument whose type has already been through the default promotions.  Must
+   agree with the target's va_arg_builtin, which walks the buffer the same way.
+   Unused unless VA_BUF_TARGET_P, but defined unconditionally so the call site
+   does not have to be preprocessed out as well. */
+static size_t MIR_UNUSED va_buf_slot_size (MIR_type_t t) {
+  return (t == MIR_T_I64 || t == MIR_T_U64 || t == MIR_T_D || t == MIR_T_LD) ? 8 : 4;
 }
 
 static void emit_insn (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
@@ -12993,6 +13014,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op1 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
       MIR_append_insn (ctx, curr_func, MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op, op1.mir_op));
     } else {
+      /* On a VA_BUF_TARGET_P target the variadic tail is not passed as
+         arguments at all: it goes into a buffer built here, and the call uses
+         the lowered signature.  va_buf_ops collects (op, type) for the tail
+         until the fixed arguments are all in place. */
+      int va_buf_p = FALSE;
+      size_t va_buf_ops_start = VARR_LENGTH (MIR_op_t, va_buf_ops);
+      size_t va_buf_size = 0;
+#if VA_BUF_TARGET_P
+      va_buf_p = func_type->u.func_type->dots_p
+                 && func_type->u.func_type->va_buf_proto_item != NULL && !jcall_p;
+      if (va_buf_p) /* swap in the lowered proto for the one pushed above */
+        VARR_SET (MIR_op_t, call_ops, ops_start,
+                  MIR_new_ref_op (ctx, func_type->u.func_type->va_buf_proto_item));
+#endif
       param_list = func_type->u.func_type->param_list;
       param = NL_HEAD (param_list->u.ops);
       for (node_t arg = first_arg; arg != NULL; arg = NL_NEXT (arg)) {
@@ -13004,6 +13039,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                 || func_type->u.func_type->dots_p);
         arg_type = e->type;
         if (struct_p) {
+          /* A struct in the variadic tail would have to be copied into the
+             buffer rather than passed. The runtime can read one back
+             (va_block_arg_builtin) but nothing here writes it yet, and the
+             lowered signature has no place to put it. */
+          if (va_buf_p && param == NULL)
+            error (c2m_ctx, POS (arg),
+                   "passing a struct or union as a variadic argument is not supported"
+                   " on this target");
         } else if (param != NULL) {
           assert (param->code == N_SPEC_DECL || param->code == N_TYPE);
           decl_spec = get_param_decl_spec (param);
@@ -13014,28 +13057,49 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         } else { /* past the declared parameters: a variadic argument */
           t = get_mir_type (c2m_ctx, e->type);
           t = promote_mir_int_type (t);
-#if defined(__wasm32__) || defined(__EMSCRIPTEN__)
-          /* This is the last place the argument's real C width is known.
-             mir-interp.c derives variadic argument types from an operand's
-             value_mode, which distinguishes only int/uint/float/double, so
-             every integer reaches _MIR_get_ff_call as MIR_T_I64 and the
-             Emscripten vararg buffer is laid out in 4-byte slots -- right for
-             %d/%c/%s/%p, silently truncating for a genuine long long.
-
-             Refusing is not the fix; the fix is for this target to build the
-             vararg buffer here, where these types are still known, and lower
-             the call to a non-variadic one taking a pointer (which is what
-             Emscripten's own clang does). Until then, say so rather than
-             printing a plausible wrong number. */
-          if (t == MIR_T_I64 || t == MIR_T_U64)
-            error (c2m_ctx, POS (arg),
-                   "wasm32: 64-bit integer as a variadic argument is not supported"
-                   " (the value would be silently truncated)");
-#endif
-          op2 = promote (c2m_ctx, op2, t == MIR_T_F ? MIR_T_D : t, FALSE);
+          if (t == MIR_T_F) t = MIR_T_D; /* default argument promotion */
+          op2 = promote (c2m_ctx, op2, t, FALSE);
+          if (va_buf_p) {
+            /* Default argument promotions have already been applied, so the
+               slot size is the promoted type's: 8 for a 64-bit integer or a
+               double, 4 for everything else including pointers.  Alignment
+               matches, which is what va_arg_builtin walks. */
+            size_t slot = va_buf_slot_size (t);
+            va_buf_size = (va_buf_size + slot - 1) / slot * slot;
+            VARR_PUSH (MIR_op_t, va_buf_ops, op2.mir_op);
+            VARR_PUSH (MIR_op_t, va_buf_ops, MIR_new_int_op (ctx, (int64_t) t));
+            VARR_PUSH (MIR_op_t, va_buf_ops, MIR_new_int_op (ctx, (int64_t) va_buf_size));
+            va_buf_size += slot;
+            continue; /* not a call argument any more */
+          }
         }
         target_add_call_arg_op (c2m_ctx, arg_type, &arg_info, op2);
         if (param != NULL) param = NL_NEXT (param);
+      }
+      if (va_buf_p) {
+        /* Allocate the buffer and fill it, then hand its address over as the
+           single trailing argument.  A zero-length tail still gets a slot, so
+           that va_arg on an absent argument reads addressable memory rather
+           than running off whatever preceded it. */
+        op_t buf = get_new_temp (c2m_ctx, MIR_T_I64);
+
+        MIR_append_insn (ctx, curr_func,
+                         MIR_new_insn (ctx, MIR_ALLOCA, buf.mir_op,
+                                       MIR_new_int_op (ctx, (int64_t) (va_buf_size == 0
+                                                                         ? 8
+                                                                         : va_buf_size))));
+        for (size_t i = va_buf_ops_start; i < VARR_LENGTH (MIR_op_t, va_buf_ops); i += 3) {
+          MIR_op_t val = VARR_GET (MIR_op_t, va_buf_ops, i);
+          MIR_type_t vt = (MIR_type_t) VARR_GET (MIR_op_t, va_buf_ops, i + 1).u.i;
+          int64_t off = VARR_GET (MIR_op_t, va_buf_ops, i + 2).u.i;
+
+          MIR_append_insn (ctx, curr_func,
+                           MIR_new_insn (ctx, tp_mov (vt),
+                                         MIR_new_mem_op (ctx, vt, off, buf.mir_op.u.reg, 0, 1),
+                                         val));
+        }
+        VARR_TRUNC (MIR_op_t, va_buf_ops, va_buf_ops_start);
+        VARR_PUSH (MIR_op_t, call_ops, buf.mir_op);
       }
       call_insn = MIR_new_insn_arr (ctx,
                                     (jcall_p    ? MIR_JCALL
@@ -13700,6 +13764,29 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
     func_type->proto_item
       = get_mir_proto (c2m_ctx,
                        func_type->dots_p || NL_HEAD (func_type->param_list->u.ops) == NULL);
+    func_type->va_buf_proto_item = NULL;
+#if VA_BUF_TARGET_P
+    /* The lowered form of the same signature: declared parameters plus the
+       vararg buffer pointer, and not variadic.  It depends only on the declared
+       parameters, so there is one per function type however many call sites
+       there are, and get_mir_proto interns it.  Only `...` gets this -- a
+       function declared with an empty parameter list is a different thing and
+       is left on the old path. */
+    if (func_type->dots_p) {
+      MIR_var_t va_var;
+
+      va_var.name = "__va_buf";
+      /* Whatever a `void *` parameter gets on this target -- wasm32 is ILP32,
+         so an unsigned 32-bit value.  Getting this wrong shows up at the JS
+         boundary as "Cannot convert a BigInt value to a number", because an
+         i64 reaches a callee expecting an i32 pointer. */
+      va_var.type = MIR_T_U32;
+      va_var.size = 0;
+      VARR_PUSH (MIR_var_t, proto_info.arg_vars, va_var);
+      func_type->va_buf_proto_item = get_mir_proto (c2m_ctx, FALSE);
+      VARR_POP (MIR_var_t, proto_info.arg_vars);
+    }
+#endif
   }
   HTAB_DESTROY (MIR_item_t, proto_tab);
 }
@@ -13712,6 +13799,7 @@ static void gen_finish (c2m_ctx_t c2m_ctx) {
   if (proto_info.arg_vars != NULL) VARR_DESTROY (MIR_var_t, proto_info.arg_vars);
   if (proto_info.ret_types != NULL) VARR_DESTROY (MIR_type_t, proto_info.ret_types);
   if (call_ops != NULL) VARR_DESTROY (MIR_op_t, call_ops);
+  if (va_buf_ops != NULL) VARR_DESTROY (MIR_op_t, va_buf_ops);
   if (ret_ops != NULL) VARR_DESTROY (MIR_op_t, ret_ops);
   if (switch_ops != NULL) VARR_DESTROY (MIR_op_t, switch_ops);
   if (switch_cases != NULL) VARR_DESTROY (case_t, switch_cases);
@@ -13734,6 +13822,7 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   VARR_CREATE (MIR_type_t, proto_info.ret_types, alloc, 16);
   gen_mir_protos (c2m_ctx);
   VARR_CREATE (MIR_op_t, call_ops, alloc, 32);
+  VARR_CREATE (MIR_op_t, va_buf_ops, alloc, 32);
   VARR_CREATE (MIR_op_t, ret_ops, alloc, 8);
   VARR_CREATE (MIR_op_t, switch_ops, alloc, 128);
   VARR_CREATE (case_t, switch_cases, alloc, 64);

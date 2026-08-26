@@ -207,9 +207,15 @@ static void wasm_ff_dispatch (int sig_index, void *addr, void *res_and_args) {
          MIR_val_t layout MIR_interp_arr wants, and it copies the arguments
          into the callee's frame before writing any result, so results and
          arguments sharing the buffer is safe. */
+      /* c2mir lowers a variadic *call* into a buffer plus a non-variadic call
+         (VA_BUF_TARGET_P), but the matching change on the definition side is
+         not done: an interpreted variadic function still expects its va_list
+         through the interpreter's own channel, and has no parameter to receive
+         the buffer pointer the caller now passes. Calling a *native* variadic
+         function -- the printf family -- works. */
       if (thunk->func_item->u.func->vararg_p) {
         MIR_get_error_func (thunk->ctx) (MIR_call_op_error,
-                                         "wasm32: calling an interpreted variadic function from "
+                                         "wasm32: calling a variadic function defined in "
                                          "interpreted code is not implemented");
         return;
       }
