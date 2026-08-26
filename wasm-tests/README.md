@@ -48,13 +48,29 @@ to be baked into it). MIR interns one interface per distinct signature, so
 Variadic calls use Emscripten's ABI, where `f(fixed..., ...)` lowers to
 `f(fixed..., void *vararg_buffer)`. `wasm_ff_dispatch` builds that buffer.
 
-## Built-in system headers
+## System headers are the embedder's job
 
-Unlike every other target, wasm32 ships minimal `stdio.h`, `stdlib.h`,
-`string.h` and `math.h` (`c2mir/wasm32/mirc_wasm32_libc.h`). A browser has
-no filesystem to read the real ones from, and without a prototype `printf`
-would be implicitly declared — producing a no-argument MIR proto that
-passes garbage. Symbols still have to be supplied via `MIR_load_external`.
+wasm32 ships only compiler-provided headers, exactly like every other
+target. It used to also bundle minimal `stdio.h`, `stdlib.h`, `string.h`
+and `math.h`, on the grounds that a browser has no filesystem to read the
+real ones from. That put the declarations in the compiler and the matching
+symbol table in the embedder — two different repositories — and they
+drifted, until the headers declared roughly twice as many functions as the
+embedder actually supplied. The surplus compiled cleanly and then failed at
+`MIR_link`.
+
+Serve libc through `c2mir_options.include_dirs` instead. Emscripten's MEMFS
+is readable by c2mir's ordinary `fopen`-based include search, so an embedder
+can write headers there at startup and generate both those headers and its
+`MIR_load_external` table from a single list, which makes drift impossible.
+
+Note that `standard_includes` is consulted *before* `system_header_dirs`, so
+anything the compiler ships under a given name shadows the embedder's copy.
+
+Calling an undeclared function no longer passes silently: c2mir warns that
+it is synthesising an `int f()` prototype. That is worth promoting to an
+error, because the synthesised prototype takes no arguments and the call is
+generated against it, so the arguments are never passed.
 
 ## Type model
 
@@ -81,10 +97,19 @@ calls in a loop.
   properly means having the c2mir wasm32 target build the variadic buffer,
   where the real C types are still known. `wasm-tests/ffi-test.c` has a
   test marked `KNOWN-BROKEN` that fails on exactly this.
-- **Native code cannot call back into interpreted functions.**
-  `_MIR_get_interp_shim`, `_MIR_get_wrapper` and `_MIR_get_thunk` are
-  inert. Implementing them needs Emscripten's `addFunction` to append to
-  the wasm table at runtime. This means e.g. passing an interpreted
-  comparator to `qsort` will not work.
+- **Native code cannot call back into interpreted functions.** A thunk here
+  is a slot in a table (`mir-wasm.c`), not a wasm function pointer, so a
+  native callee cannot call one through `wasmTable`. Passing an interpreted
+  comparator to `qsort` will not work. Fixing it needs Emscripten's
+  `addFunction` to append a real table entry at runtime.
+
+  Note this is now only about *native* callees. Interpreted code calling
+  interpreted code works: `_MIR_get_thunk` used to return one shared
+  do-nothing stub for every function and `_MIR_redirect_thunk` was inert, so
+  such calls invoked an empty stub and silently produced 0. That was masked
+  for shallow calls by MIR's inliner, and surfaced as recursion returning
+  wrong answers past roughly 15 frames — where the inliner gives up.
+- **Calling an interpreted variadic function from interpreted code** raises
+  an explicit error rather than returning garbage.
 - `long double` precision is that of `double`, so `%Lf` is not usable.
 - Multiple return values are rejected.
