@@ -2605,6 +2605,32 @@ static void process_pack_pragma (c2m_ctx_t c2m_ctx, token_t t, token_t *tokens_a
       while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
     }
   }
+  /* The alignment may be spelled as an object-like macro rather than a bare
+     number -- the MinGW/UCRT headers write `pack(push,_CRT_PACKING)` with
+     `#define _CRT_PACKING 8`, and MSVC/GCC expand it.  Pragma token streams
+     are not macro-expanded here, so chase single-token object-like macros by
+     hand (bounded, for macro-to-macro chains) until a number surfaces.  A
+     function-like or multi-token macro falls through to the existing
+     "expected ')'" diagnostic, same as before. */
+  {
+    int depth;
+    for (depth = 0; depth < 8 && i < tokens_len && tokens_arr[i]->code == T_ID; depth++) {
+      struct macro macro_struct;
+      macro_t m;
+      token_t val_tok = NULL;
+      macro_struct.id = tokens_arr[i];
+      if (!HTAB_DO (macro_t, macro_tab, &macro_struct, HTAB_FIND, m)) break;
+      if (m->params != NULL || m->replacement == NULL) break;
+      for (size_t r = 0; r < VARR_LENGTH (token_t, m->replacement); r++) {
+        token_t rt = VARR_GET (token_t, m->replacement, r);
+        if (rt->code == ' ' || rt->code == '\n') continue;
+        if (val_tok != NULL) { val_tok = NULL; break; } /* multi-token */
+        val_tok = rt;
+      }
+      if (val_tok == NULL || (val_tok->code != T_NUMBER && val_tok->code != T_ID)) break;
+      tokens_arr[i] = val_tok;
+    }
+  }
   if (i < tokens_len && tokens_arr[i]->code == T_NUMBER) {
     val = atoi (tokens_arr[i]->repr);
     have_val = TRUE;
