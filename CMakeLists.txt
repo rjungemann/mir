@@ -125,9 +125,13 @@ target_link_libraries(scan_test mir)
 add_executable (io_test "mir-tests/io.c")
 target_link_libraries(io_test mir)
 
+add_executable (wrapper_abi_test "mir-tests/wrapper-abi.c")
+target_link_libraries(wrapper_abi_test mir)
+
 add_test(simplify-test simplify_test)
 add_test(scan-test scan_test)
 add_test(io-test io_test)
+add_test(wrapper-abi-test wrapper_abi_test)
 
 # ------------------ Common for MIR tests ----------------------
 add_executable (run_test "mir-tests/run-test.c")
