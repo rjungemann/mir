@@ -99,8 +99,6 @@ struct interp_ctx {
   void *(*bstart_builtin) (void);
   void (*bend_builtin) (void *);
   void *jret_addr;
-  VARR (MIR_val_t) * call_res_args_varr;
-  MIR_val_t *call_res_args;
   VARR (_MIR_arg_desc_t) * call_arg_descs_varr;
   _MIR_arg_desc_t *call_arg_descs;
   HTAB (ff_interface_t) * ff_interface_tab;
@@ -117,8 +115,6 @@ struct interp_ctx {
 #define trace_ident interp_ctx->trace_ident
 #define bstart_builtin interp_ctx->bstart_builtin
 #define bend_builtin interp_ctx->bend_builtin
-#define call_res_args_varr interp_ctx->call_res_args_varr
-#define call_res_args interp_ctx->call_res_args
 #define call_arg_descs_varr interp_ctx->call_arg_descs_varr
 #define call_arg_descs interp_ctx->call_arg_descs
 #define ff_interface_tab interp_ctx->ff_interface_tab
@@ -1780,6 +1776,7 @@ static void call (MIR_context_t ctx, MIR_val_t *bp, MIR_op_t *insn_arg_ops, code
   MIR_proto_t proto = proto_item->u.proto;
   MIR_op_mode_t mode;
   void *ff_interface_addr;
+  MIR_val_t *res_args;
 
   if (proto->args == NULL) {
     mir_assert (nargs == 0 && !proto->vararg_p);
@@ -1791,11 +1788,16 @@ static void call (MIR_context_t ctx, MIR_val_t *bp, MIR_op_t *insn_arg_ops, code
     arg_vars_num = VARR_LENGTH (MIR_var_t, proto->args);
   }
   nres = proto->nres;
-  if (VARR_EXPAND (MIR_val_t, call_res_args_varr, nargs + nres)
-      || VARR_EXPAND (_MIR_arg_desc_t, call_arg_descs_varr, nargs)) {
-    call_res_args = VARR_ADDR (MIR_val_t, call_res_args_varr);
+  if (VARR_EXPAND (_MIR_arg_desc_t, call_arg_descs_varr, nargs))
     call_arg_descs = VARR_ADDR (_MIR_arg_desc_t, call_arg_descs_varr);
-  }
+  /* The result/argument buffer stays live *across* the foreign call, and the
+     results are read back out of it afterwards, so it goes on the C stack
+     rather than in a context-wide VARR.  A callee that re-enters interpreted
+     code -- a qsort comparator, say -- runs a nested call() inside that window;
+     a shared buffer would be overwritten by it, or reallocated out from under
+     the pointer already handed to the interface.  call_arg_descs is only read
+     before the call, so it can stay shared. */
+  res_args = alloca ((nargs + nres + 1) * sizeof (MIR_val_t));
   if ((ff_interface_addr = ffi_address_ptr->a) == NULL) {
     for (i = 0; i < nargs; i++) {
       if (i < arg_vars_num) {
@@ -1826,45 +1828,45 @@ static void call (MIR_context_t ctx, MIR_val_t *bp, MIR_op_t *insn_arg_ops, code
 
   for (i = 0; i < nargs; i++) {
     if (i >= arg_vars_num) {
-      call_res_args[i + nres] = arg_vals[i];
+      res_args[i + nres] = arg_vals[i];
       continue;
     }
     type = arg_vars[i].type;
     switch (type) {
-    case MIR_T_I8: call_res_args[i + nres].i = (int8_t) (arg_vals[i].i); break;
-    case MIR_T_U8: call_res_args[i + nres].u = (uint8_t) (arg_vals[i].i); break;
-    case MIR_T_I16: call_res_args[i + nres].i = (int16_t) (arg_vals[i].i); break;
-    case MIR_T_U16: call_res_args[i + nres].u = (uint16_t) (arg_vals[i].i); break;
-    case MIR_T_I32: call_res_args[i + nres].i = (int32_t) (arg_vals[i].i); break;
-    case MIR_T_U32: call_res_args[i + nres].u = (uint32_t) (arg_vals[i].i); break;
-    case MIR_T_I64: call_res_args[i + nres].i = (int64_t) (arg_vals[i].i); break;
-    case MIR_T_U64: call_res_args[i + nres].u = (uint64_t) (arg_vals[i].i); break;
-    case MIR_T_F: call_res_args[i + nres].f = arg_vals[i].f; break;
-    case MIR_T_D: call_res_args[i + nres].d = arg_vals[i].d; break;
-    case MIR_T_LD: call_res_args[i + nres].ld = arg_vals[i].ld; break;
-    case MIR_T_P: call_res_args[i + nres].u = (uint64_t) arg_vals[i].a; break;
+    case MIR_T_I8: res_args[i + nres].i = (int8_t) (arg_vals[i].i); break;
+    case MIR_T_U8: res_args[i + nres].u = (uint8_t) (arg_vals[i].i); break;
+    case MIR_T_I16: res_args[i + nres].i = (int16_t) (arg_vals[i].i); break;
+    case MIR_T_U16: res_args[i + nres].u = (uint16_t) (arg_vals[i].i); break;
+    case MIR_T_I32: res_args[i + nres].i = (int32_t) (arg_vals[i].i); break;
+    case MIR_T_U32: res_args[i + nres].u = (uint32_t) (arg_vals[i].i); break;
+    case MIR_T_I64: res_args[i + nres].i = (int64_t) (arg_vals[i].i); break;
+    case MIR_T_U64: res_args[i + nres].u = (uint64_t) (arg_vals[i].i); break;
+    case MIR_T_F: res_args[i + nres].f = arg_vals[i].f; break;
+    case MIR_T_D: res_args[i + nres].d = arg_vals[i].d; break;
+    case MIR_T_LD: res_args[i + nres].ld = arg_vals[i].ld; break;
+    case MIR_T_P: res_args[i + nres].u = (uint64_t) arg_vals[i].a; break;
     default:
       mir_assert (MIR_all_blk_type_p (type));
-      call_res_args[i + nres].u = (uint64_t) arg_vals[i].a;
+      res_args[i + nres].u = (uint64_t) arg_vals[i].a;
       break;
     }
   }
-  ((void (*) (void *, void *)) ff_interface_addr) (addr, call_res_args); /* call */
+  ((void (*) (void *, void *)) ff_interface_addr) (addr, res_args); /* call */
   for (i = 0; i < nres; i++) {
     res = &bp[get_i (res_ops + i)];
     switch (proto->res_types[i]) {
-    case MIR_T_I8: res->i = (int8_t) (call_res_args[i].i); break;
-    case MIR_T_U8: res->u = (uint8_t) (call_res_args[i].u); break;
-    case MIR_T_I16: res->i = (int16_t) (call_res_args[i].i); break;
-    case MIR_T_U16: res->u = (uint16_t) (call_res_args[i].u); break;
-    case MIR_T_I32: res->i = (int32_t) (call_res_args[i].i); break;
-    case MIR_T_U32: res->u = (uint32_t) (call_res_args[i].u); break;
-    case MIR_T_I64: res->i = (int64_t) (call_res_args[i].i); break;
-    case MIR_T_U64: res->u = (uint64_t) (call_res_args[i].u); break;
-    case MIR_T_F: res->f = call_res_args[i].f; break;
-    case MIR_T_D: res->d = call_res_args[i].d; break;
-    case MIR_T_LD: res->ld = call_res_args[i].ld; break;
-    case MIR_T_P: res->a = call_res_args[i].a; break;
+    case MIR_T_I8: res->i = (int8_t) (res_args[i].i); break;
+    case MIR_T_U8: res->u = (uint8_t) (res_args[i].u); break;
+    case MIR_T_I16: res->i = (int16_t) (res_args[i].i); break;
+    case MIR_T_U16: res->u = (uint16_t) (res_args[i].u); break;
+    case MIR_T_I32: res->i = (int32_t) (res_args[i].i); break;
+    case MIR_T_U32: res->u = (uint32_t) (res_args[i].u); break;
+    case MIR_T_I64: res->i = (int64_t) (res_args[i].i); break;
+    case MIR_T_U64: res->u = (uint64_t) (res_args[i].u); break;
+    case MIR_T_F: res->f = res_args[i].f; break;
+    case MIR_T_D: res->d = res_args[i].d; break;
+    case MIR_T_LD: res->ld = res_args[i].ld; break;
+    case MIR_T_P: res->a = res_args[i].a; break;
     default: mir_assert (FALSE);
     }
   }
@@ -1886,9 +1888,7 @@ static void interp_init (MIR_context_t ctx) {
   VARR_CREATE (MIR_val_t, code_varr, alloc, 0);
   VARR_CREATE (MIR_val_t, arg_vals_varr, alloc, 0);
   arg_vals = VARR_ADDR (MIR_val_t, arg_vals_varr);
-  VARR_CREATE (MIR_val_t, call_res_args_varr, alloc, 0);
   VARR_CREATE (_MIR_arg_desc_t, call_arg_descs_varr, alloc, 0);
-  call_res_args = VARR_ADDR (MIR_val_t, call_res_args_varr);
   call_arg_descs = VARR_ADDR (_MIR_arg_desc_t, call_arg_descs_varr);
   HTAB_CREATE_WITH_FREE_FUNC (ff_interface_t, ff_interface_tab, alloc, 1000, ff_interface_hash,
                               ff_interface_eq, ff_interface_clear, alloc);
@@ -1905,7 +1905,6 @@ static void interp_finish (MIR_context_t ctx) {
   VARR_DESTROY (MIR_insn_t, branches);
   VARR_DESTROY (MIR_val_t, code_varr);
   VARR_DESTROY (MIR_val_t, arg_vals_varr);
-  VARR_DESTROY (MIR_val_t, call_res_args_varr);
   VARR_DESTROY (_MIR_arg_desc_t, call_arg_descs_varr);
   HTAB_DESTROY (ff_interface_t, ff_interface_tab);
   /* Clear func descs???  */
