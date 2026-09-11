@@ -138,7 +138,7 @@ static char aarch64_mirc[]
     "#define __ARM64_ARCH_8__ 1\n"
     "#define __ARM_ALIGN_MAX_STACK_PWR 4\n"
     "#define __ARM_ARCH_8_3__ 1\n"
-    "typedef struct {unsigned long hi, lo;} __uint128_t;\n"
+    "typedef struct {_Alignas(16) unsigned long hi; unsigned long lo;} __uint128_t;\n"
     "extern float __nan (void);\n"
     "#define _Float16 short\n"
 #endif

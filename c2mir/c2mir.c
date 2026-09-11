@@ -89,6 +89,9 @@ DEF_VARR (char_ptr_t);
 typedef void *void_ptr_t;
 DEF_VARR (void_ptr_t);
 
+/* Hoisted from the generator section: pre_ctx's #pragma pack stack needs it. */
+DEF_VARR (int);
+
 typedef struct {
   const char *s;
   size_t len;
@@ -615,6 +618,13 @@ DEF_DLIST_TYPE (node_t);
 struct node {
   node_code_t code;
   unsigned uid;
+  int pack; /* #pragma pack in effect for N_STRUCT/N_UNION (0 = none) */
+  /* C23 enum with a fixed underlying type (`enum E : uint64_t`): the
+     spec-qual-list after the ':', for N_ENUM only.  Deliberately NOT an operand
+     of the node -- keeping it out of u.ops means no generic op walker sees it
+     and the N_ENUM arity the rest of the file assumes is unchanged; the checker
+     resolves it explicitly. */
+  node_t enum_base;
   void *attr; /* used a scope for parser and as an attribute after */
   DLIST_LINK (node_t) op_link;
   union {
@@ -647,6 +657,11 @@ DEF_DLIST_CODE (node_t, op_link);
 struct token {
   int code : 16; /* token_code_t and EOF */
   int processed_p : 16;
+  /* #pragma pack: the packing in effect when this token was emitted (0 = none).
+     Stamped in out_token, which runs in preprocessing order, so the value is
+     correct across include nesting -- unlike anything keyed on source position.
+     The parser reads it off the struct/union keyword. */
+  int pack;
   pos_t pos;
   node_code_t node_code;
   node_t node;
@@ -685,6 +700,8 @@ static node_t new_node (c2m_ctx_t c2m_ctx, node_code_t nc) {
 
   n->code = nc;
   n->uid = curr_uid++;
+  n->pack = 0;
+  n->enum_base = NULL;
   DLIST_INIT (node_t, n->u.ops);
   n->attr = NULL;
   set_node_pos (c2m_ctx, n, no_pos);
@@ -2012,6 +2029,8 @@ struct pre_ctx {
   token_t pre_last_token;
   pos_t actual_pre_pos;
   unsigned long pptokens_num;
+  int curr_pack;              /* #pragma pack value in effect (0 = none) */
+  VARR (int) * pack_stack;    /* #pragma pack(push/pop) stack */
   void (*pre_out_token_func) (c2m_ctx_t c2m_ctx, token_t);
 };
 
@@ -2033,6 +2052,8 @@ struct pre_ctx {
 #define pre_last_token pre_ctx->pre_last_token
 #define actual_pre_pos pre_ctx->actual_pre_pos
 #define pptokens_num pre_ctx->pptokens_num
+#define curr_pack pre_ctx->curr_pack
+#define pack_stack pre_ctx->pack_stack
 #define pre_out_token_func pre_ctx->pre_out_token_func
 
 static int pre_skip_if_part_p (c2m_ctx_t c2m_ctx) {
@@ -2186,6 +2207,8 @@ static void pre_init (c2m_ctx_t c2m_ctx) {
   date_str[strlen (date_str) - 1] = '\0';
   strcpy (time_str, time_str_repr + 1);
   time_str[strlen (time_str) - 1] = '\0';
+  VARR_CREATE (int, pack_stack, alloc, 8);
+  curr_pack = 0;
   VARR_CREATE (char_ptr_t, once_include_files, alloc, 64);
   VARR_CREATE (token_t, temp_tokens, alloc, 128);
   VARR_CREATE (token_t, output_buffer, alloc, 2048);
@@ -2198,6 +2221,7 @@ static void pre_finish (c2m_ctx_t c2m_ctx) {
   pre_ctx_t pre_ctx;
 
   if (c2m_ctx == NULL || (pre_ctx = c2m_ctx->pre_ctx) == NULL) return;
+  if (pack_stack != NULL) VARR_DESTROY (int, pack_stack);
   if (once_include_files != NULL) VARR_DESTROY (char_ptr_t, once_include_files);
   if (temp_tokens != NULL) VARR_DESTROY (token_t, temp_tokens);
   if (output_buffer != NULL) VARR_DESTROY (token_t, output_buffer);
@@ -2542,6 +2566,101 @@ static pos_t check_line_directive_args (c2m_ctx_t c2m_ctx, VARR (token_t) * buff
   return no_pos;
 }
 
+/* #pragma pack -- MSVC/GCC form, as the Apple and Windows SDK headers use it:
+     pack(N) | pack() | pack(push) | pack(push, N) | pack(pop) | pack(pop, N)
+   N must be a power of two (1..16); pack() and a bare pop restore the default.
+
+   The value is kept in the PREPROCESSOR because that is the only stage that
+   sees these directives -- they never reach the parser.  out_token stamps the
+   value in effect onto every token it emits, and since out_token runs in
+   preprocessing order the stamp stays correct across include nesting (a
+   pack(push) left open by a header applies to whatever follows it, exactly as
+   in a real compiler).  The parser then lifts the stamp off the struct/union
+   keyword; see the N_STRUCT/N_UNION arm of struct_or_union_specifier. */
+static void process_pack_pragma (c2m_ctx_t c2m_ctx, token_t t, token_t *tokens_arr,
+                                 size_t tokens_len, size_t i) {
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  int push_p = FALSE, pop_p = FALSE, val = 0, have_val = FALSE;
+
+  while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
+  if (i >= tokens_len || tokens_arr[i]->code != '(') {
+    warning (c2m_ctx, t->pos, "wrong #pragma pack: expected '('");
+    return;
+  }
+  i++;
+  while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
+  if (i < tokens_len && tokens_arr[i]->code == T_ID) {
+    if (strcmp (tokens_arr[i]->repr, "push") == 0) {
+      push_p = TRUE;
+    } else if (strcmp (tokens_arr[i]->repr, "pop") == 0) {
+      pop_p = TRUE;
+    } else { /* an identifier label form we do not model */
+      warning (c2m_ctx, t->pos, "unsupported #pragma pack form -- ignored");
+      return;
+    }
+    i++;
+    while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
+    if (i < tokens_len && tokens_arr[i]->code == ',') {
+      i++;
+      while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
+    }
+  }
+  /* The alignment may be spelled as an object-like macro rather than a bare
+     number -- the MinGW/UCRT headers write `pack(push,_CRT_PACKING)` with
+     `#define _CRT_PACKING 8`, and MSVC/GCC expand it.  Pragma token streams
+     are not macro-expanded here, so chase single-token object-like macros by
+     hand (bounded, for macro-to-macro chains) until a number surfaces.  A
+     function-like or multi-token macro falls through to the existing
+     "expected ')'" diagnostic, same as before. */
+  {
+    int depth;
+    for (depth = 0; depth < 8 && i < tokens_len && tokens_arr[i]->code == T_ID; depth++) {
+      struct macro macro_struct;
+      macro_t m;
+      token_t val_tok = NULL;
+      macro_struct.id = tokens_arr[i];
+      if (!HTAB_DO (macro_t, macro_tab, &macro_struct, HTAB_FIND, m)) break;
+      if (m->params != NULL || m->replacement == NULL) break;
+      for (size_t r = 0; r < VARR_LENGTH (token_t, m->replacement); r++) {
+        token_t rt = VARR_GET (token_t, m->replacement, r);
+        if (rt->code == ' ' || rt->code == '\n') continue;
+        if (val_tok != NULL) { val_tok = NULL; break; } /* multi-token */
+        val_tok = rt;
+      }
+      if (val_tok == NULL || (val_tok->code != T_NUMBER && val_tok->code != T_ID)) break;
+      tokens_arr[i] = val_tok;
+    }
+  }
+  if (i < tokens_len && tokens_arr[i]->code == T_NUMBER) {
+    val = atoi (tokens_arr[i]->repr);
+    have_val = TRUE;
+    if (val <= 0 || val > 16 || (val & (val - 1)) != 0) {
+      warning (c2m_ctx, t->pos, "#pragma pack: alignment must be a power of 2 in 1..16 -- ignored");
+      return;
+    }
+    i++;
+    while (i < tokens_len && tokens_arr[i]->code == ' ') i++;
+  }
+  if (i >= tokens_len || tokens_arr[i]->code != ')') {
+    warning (c2m_ctx, t->pos, "wrong #pragma pack: expected ')'");
+    return;
+  }
+  if (push_p) {
+    VARR_PUSH (int, pack_stack, curr_pack);
+    if (have_val) curr_pack = val;
+  } else if (pop_p) {
+    if (VARR_LENGTH (int, pack_stack) == 0) {
+      warning (c2m_ctx, t->pos, "#pragma pack(pop) without a matching push -- ignored");
+      return;
+    }
+    curr_pack = VARR_POP (int, pack_stack);
+    /* `pop, N` pops and then sets N (MSVC semantics). */
+    if (have_val) curr_pack = val;
+  } else {
+    curr_pack = have_val ? val : 0; /* pack() restores the default */
+  }
+}
+
 static void check_pragma (c2m_ctx_t c2m_ctx, token_t t, VARR (token_t) * tokens) {
   token_t *tokens_arr = VARR_ADDR (token_t, tokens);
   size_t i, tokens_len = VARR_LENGTH (token_t, tokens);
@@ -2556,6 +2675,11 @@ static void check_pragma (c2m_ctx_t c2m_ctx, token_t t, VARR (token_t) * tokens)
     return;
   }
 #endif
+  if (i < tokens_len && tokens_arr[i]->code == T_ID
+      && strcmp (tokens_arr[i]->repr, "pack") == 0) {
+    process_pack_pragma (c2m_ctx, t, tokens_arr, tokens_len, i + 1);
+    return;
+  }
   if (i >= tokens_len || tokens_arr[i]->code != T_ID || strcmp (tokens_arr[i]->repr, "STDC") != 0) {
     warning (c2m_ctx, t->pos, "unknown pragma");
     return;
@@ -2931,6 +3055,12 @@ static void flush_buffer (c2m_ctx_t c2m_ctx) {
 static void out_token (c2m_ctx_t c2m_ctx, token_t t) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
 
+  /* #pragma pack: stamp the packing in effect.  This is the one place every
+     parser-bound token passes through, and it runs in preprocessing order, so
+     the stamp is right even when a pack(push) spans an #include.  Buffered
+     (macro-call) tokens are stamped here too and keep the stamp through
+     flush_buffer. */
+  t->pack = curr_pack;
   if (no_out_p || VARR_LENGTH (macro_call_t, macro_call_stack) != 0) {
     VARR_PUSH (token_t, output_buffer, t);
     return;
@@ -4568,7 +4698,7 @@ D (sc_spec) {
 DA (type_spec) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t op1, op2, op3, op4, r;
-  int struct_p, id_p = FALSE;
+  int struct_p, id_p = FALSE, tok_pack = 0;
   pos_t pos;
 
   if (MP (T_VOID, pos)) {
@@ -4599,8 +4729,10 @@ DA (type_spec) {
     P (type_name);
     PT (')');
     error (c2m_ctx, pos, "Atomic types are not supported");
-  } else if ((struct_p = MP (T_STRUCT, pos)) || MP (T_UNION, pos)) {
+  } else if ((tok_pack = curr_token->pack, (struct_p = MP (T_STRUCT, pos)) || MP (T_UNION, pos))) {
     /* struct-or-union-specifier, struct-or-union */
+    /* #pragma pack: read the stamp off the keyword BEFORE MP consumes it --
+       curr_token is still the struct/union token when the comma operand runs. */
     if (!MN (T_ID, op1)) {
       op1 = new_node (c2m_ctx, N_IGNORE);
     } else {
@@ -4620,11 +4752,24 @@ DA (type_spec) {
       r = new_node (c2m_ctx, N_IGNORE);
     }
     r = new_pos_node2 (c2m_ctx, struct_p ? N_STRUCT : N_UNION, pos, op1, r);
+    r->pack = tok_pack; /* #pragma pack in effect at the declaration */
   } else if (MP (T_ENUM, pos)) { /* enum-specifier */
+    node_t enum_base = NULL;
+
     if (!MN (T_ID, op1)) {
       op1 = new_node (c2m_ctx, N_IGNORE);
     } else {
       id_p = TRUE;
+    }
+    /* C23 enum-type-specifier: `enum [tag] : specifier-qualifier-list`.  The
+       Darwin SDK reaches this through malloc/malloc.h:96
+       (`typedef enum __enum_options : uint64_t {...}`, where __enum_options
+       expands to nothing for a compiler that does not advertise the
+       __flag_enum__ attribute). */
+    if (M (':')) {
+      P (spec_qual_list);
+      enum_base = r;
+      if (!C ('{') && !id_p) return err_node;
     }
     op2 = new_node (c2m_ctx, N_LIST);
     if (M ('{')) { /* enumerator-list */
@@ -4648,6 +4793,7 @@ DA (type_spec) {
       op2 = new_node (c2m_ctx, N_IGNORE);
     }
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
+    r->enum_base = enum_base;
   } else if (arg == NULL) {
     P (typedef_name);
   } else {
@@ -4684,6 +4830,13 @@ D (struct_declaration) {
   if (C (T_STATIC_ASSERT)) {
     P (st_assert);
   } else {
+    /* A member declaration may LEAD with a GCC attribute, exactly as an
+       ordinary declaration may -- `declaration` already swallows one here.
+       <dirent.h>:84 is `__unused long __padding;`, and sys/cdefs.h:172 defines
+       __unused unconditionally as __attribute__((__unused__)), so without this
+       the whole DIR struct fails to parse and every later use of a `DIR *`
+       reports an undeclared identifier. */
+    try_attr_spec (c2m_ctx, curr_token->pos, NULL);
     P (spec_qual_list);
     spec = r;
     list = new_node (c2m_ctx, N_LIST);
@@ -4727,7 +4880,10 @@ D (spec_qual_list) {
 
   list = new_node (c2m_ctx, N_LIST);
   for (first_p = TRUE;; first_p = FALSE) {
-    if (C (T_CONST) || C (T_RESTRICT) || C (T_VOLATILE) || C (T_ATOMIC)) {
+    if (C (T_ALIGNAS)) { /* C23 / gcc+clang: alignment-specifier in a member decl */
+      P (align_spec);
+      op = r;
+    } else if (C (T_CONST) || C (T_RESTRICT) || C (T_VOLATILE) || C (T_ATOMIC)) {
       P (type_qual);
       op = r;
     } else if ((op = TRY_A (type_spec, arg)) != err_node) {
@@ -6115,6 +6271,11 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
               && expr->c.u_val == 0)
             continue;
           member_align = type_align (decl->decl_spec.type);
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
+          /* #pragma pack caps a member's contribution to the aggregate's own
+             alignment, exactly as it caps its offset alignment below. */
+          if (type->u.tag_type->pack > 0 && member_align > type->u.tag_type->pack)
+            member_align = type->u.tag_type->pack;
           if (align < member_align) align = member_align;
         }
     }
@@ -6266,6 +6427,8 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
                to the current (aligned) running offset; do not grow the type. */
             member_align = type_align (decl->decl_spec.type);
             if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
+            if (type->u.tag_type->pack > 0 && member_align > type->u.tag_type->pack)
+              member_align = type->u.tag_type->pack;
             decl->offset = type->mode == TM_UNION
                              ? 0
                              : (overall_size + member_align - 1) / member_align * member_align;
@@ -6274,6 +6437,12 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
             continue;
           }
           member_align = type_align (decl->decl_spec.type);
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
+          /* #pragma pack(N): a member is aligned to min(its own alignment, N).
+             An explicit _Alignas that exceeds N is honoured first above and
+             then capped, matching gcc/clang. */
+          if (type->u.tag_type->pack > 0 && member_align > type->u.tag_type->pack)
+            member_align = type->u.tag_type->pack;
           bits
             = width->code == N_IGNORE || !(expr = width->attr)->const_p ? -1 : (int) expr->c.u_val;
           update_field_layout (&bf_p, &overall_size, &offset, &bound_bit, prev_size, member_size,
@@ -6823,15 +6992,40 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       node_t res_tag_type, id = NL_HEAD (n->u.ops);
       node_t enum_list = NL_NEXT (id);
       node_t enum_const_scope = skip_struct_scopes (curr_scope);
+      /* C23 fixed underlying type, TP_UNDEF when the enum does not name one. */
+      enum basic_type fixed_basic_type = TP_UNDEF;
 
+      if (n->enum_base != NULL) {
+        struct decl_spec base_spec = check_decl_spec (c2m_ctx, n->enum_base, n);
+
+        if (base_spec.type == NULL || base_spec.type->mode != TM_BASIC
+            || !integer_type_p (base_spec.type)) {
+          error (c2m_ctx, POS (n), "enum underlying type is not an integer type");
+        } else {
+          fixed_basic_type = base_spec.type->u.basic_type;
+        }
+      }
       set_type_pos_node (type, n);
       res_tag_type = process_tag (c2m_ctx, n, id, enum_list);
       check_type_duplication (c2m_ctx, type, n, "enum", size, sign);
       type->mode = TM_ENUM;
       type->u.tag_type = res_tag_type;
       if (enum_list->code == N_IGNORE) {
-        if (incomplete_type_p (c2m_ctx, type))
+        /* C23: `enum E : T;` has a known storage size even with no enumerator
+           list, so it is a complete type -- attach the enum_type here rather
+           than reporting an unknown size. */
+        if (fixed_basic_type != TP_UNDEF) {
+          if (n->attr == NULL) {
+            struct enum_type *enum_type;
+
+            n->attr = enum_type = reg_malloc (c2m_ctx, sizeof (struct enum_type));
+            enum_type->enum_basic_type = fixed_basic_type;
+          }
+          if (res_tag_type != n && res_tag_type->attr == NULL)
+            res_tag_type->attr = n->attr;
+        } else if (incomplete_type_p (c2m_ctx, type)) {
           error (c2m_ctx, POS (n), "enum storage size is unknown");
+        }
       } else {
         mir_llong curr_val = -1, min_val = 0;
         mir_ullong max_val = 0;
@@ -6839,7 +7033,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         int neg_p = FALSE;
 
         n->attr = enum_type = reg_malloc (c2m_ctx, sizeof (struct enum_type));
-        enum_type->enum_basic_type = TP_INT;                                           // ???
+        enum_type->enum_basic_type = fixed_basic_type != TP_UNDEF ? fixed_basic_type : TP_INT;
         for (node_t en = NL_HEAD (enum_list->u.ops); en != NULL; en = NL_NEXT (en)) {  // ??? id
           node_t const_expr;
           symbol_t sym;
@@ -6887,13 +7081,19 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
             }
             enum_value->u.i_val = curr_val;
           }
-          enum_type->enum_basic_type
-            = (max_val <= MIR_INT_MAX && MIR_INT_MIN <= min_val     ? TP_INT
-               : max_val <= MIR_UINT_MAX && 0 <= min_val            ? TP_UINT
-               : max_val <= MIR_LONG_MAX && MIR_LONG_MIN <= min_val ? TP_LONG
-               : max_val <= MIR_ULONG_MAX && 0 <= min_val           ? TP_ULONG
-               : min_val < 0 || max_val <= MIR_LLONG_MAX            ? TP_LLONG
-                                                                    : TP_ULLONG);
+          /* C23: a fixed underlying type IS the enum's type -- it is not
+             widened or narrowed to fit the enumerators.  Only infer when the
+             declaration did not name one. */
+          if (fixed_basic_type != TP_UNDEF)
+            enum_type->enum_basic_type = fixed_basic_type;
+          else
+            enum_type->enum_basic_type
+              = (max_val <= MIR_INT_MAX && MIR_INT_MIN <= min_val     ? TP_INT
+                 : max_val <= MIR_UINT_MAX && 0 <= min_val            ? TP_UINT
+                 : max_val <= MIR_LONG_MAX && MIR_LONG_MIN <= min_val ? TP_LONG
+                 : max_val <= MIR_ULONG_MAX && 0 <= min_val           ? TP_ULONG
+                 : min_val < 0 || max_val <= MIR_LLONG_MAX            ? TP_LLONG
+                                                                      : TP_ULLONG);
         }
       }
       break;
@@ -10155,7 +10355,6 @@ struct reg_var {
 typedef struct reg_var reg_var_t;
 
 DEF_HTAB (reg_var_t);
-DEF_VARR (int);
 DEF_VARR (MIR_type_t);
 
 struct init_el {
