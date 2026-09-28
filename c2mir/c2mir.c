@@ -5998,16 +5998,27 @@ static struct type arithmetic_conversion (const struct type *type1, const struct
 
     if (signed_integer_type_p (&t1)) SWAP (t1, t2, t);
     assert (!signed_integer_type_p (&t1) && signed_integer_type_p (&t2));
-    if ((t1.u.basic_type == TP_ULONG && t2.u.basic_type < TP_LONG)
-        || (t1.u.basic_type == TP_ULLONG && t2.u.basic_type < TP_LLONG)) {
+    /* C11 6.3.1.8, with both operands promoted: the unsigned type wins when
+       its rank is at least the signed one's; otherwise the signed type wins
+       when it can represent every value of the unsigned one, and its unsigned
+       counterpart wins when it cannot.  This used to ask MIR_LONG_MAX about
+       every signed type of rank long or above, which on an LLP64 target
+       (win64: 32-bit long) sent `long long OP unsigned int` to unsigned int --
+       so `(int64_t) 5u - 7u` was 4294967294, not -2.  */
+    int urank = t1.u.basic_type == TP_UINT ? 1 : t1.u.basic_type == TP_ULONG ? 2 : 3;
+    int srank = t2.u.basic_type == TP_LONG ? 2 : t2.u.basic_type == TP_LLONG ? 3 : 1;
+    mir_ullong umax = (t1.u.basic_type == TP_UINT    ? (mir_ullong) MIR_UINT_MAX
+                       : t1.u.basic_type == TP_ULONG ? (mir_ullong) MIR_ULONG_MAX
+                                                     : (mir_ullong) MIR_ULLONG_MAX);
+    mir_ullong smax = (t2.u.basic_type == TP_LONG    ? (mir_ullong) MIR_LONG_MAX
+                       : t2.u.basic_type == TP_LLONG ? (mir_ullong) MIR_LLONG_MAX
+                                                     : (mir_ullong) MIR_INT_MAX);
+    if (urank >= srank) {
       res.u.basic_type = t1.u.basic_type;
-    } else if ((t1.u.basic_type == TP_UINT && t2.u.basic_type >= TP_LONG
-                && MIR_LONG_MAX >= MIR_UINT_MAX)
-               || (t1.u.basic_type == TP_ULONG && t2.u.basic_type >= TP_LLONG
-                   && MIR_LLONG_MAX >= MIR_ULONG_MAX)) {
+    } else if (smax >= umax) {
       res.u.basic_type = t2.u.basic_type;
     } else {
-      res.u.basic_type = t1.u.basic_type;
+      res.u.basic_type = t2.u.basic_type == TP_LONG ? TP_ULONG : TP_ULLONG;
     }
   }
   return res;
