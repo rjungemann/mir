@@ -5744,6 +5744,7 @@ struct check_ctx {
   node_t curr_unnamed_anon_struct_union_member;
   node_t curr_switch;
   VARR (decl_t) * func_decls_for_allocation;
+  VARR (node_t) * func_stmtexprs_for_allocation;
   VARR (node_t) * possible_incomplete_decls;
   node_t n_i1_node;
   HTAB (case_t) * case_tab;
@@ -5761,6 +5762,7 @@ struct check_ctx {
 #define curr_unnamed_anon_struct_union_member check_ctx->curr_unnamed_anon_struct_union_member
 #define curr_switch check_ctx->curr_switch
 #define func_decls_for_allocation check_ctx->func_decls_for_allocation
+#define func_stmtexprs_for_allocation check_ctx->func_stmtexprs_for_allocation
 #define possible_incomplete_decls check_ctx->possible_incomplete_decls
 #define n_i1_node check_ctx->n_i1_node
 #define case_tab check_ctx->case_tab
@@ -8666,6 +8668,26 @@ static void process_func_decls_for_allocation (c2m_ctx_t c2m_ctx) {
   }
 }
 
+/* Place the struct/union result slot of every statement expression in the function after all
+   of its stack variables, i.e. after the frame size process_func_decls_for_allocation computed
+   (which already covers every nested scope): */
+static void process_func_stmtexprs_for_allocation (c2m_ctx_t c2m_ctx, node_t block) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  struct node_scope *ns = block->attr;
+
+  for (size_t i = 0; i < VARR_LENGTH (node_t, func_stmtexprs_for_allocation); i++) {
+    node_t r = VARR_GET (node_t, func_stmtexprs_for_allocation, i);
+    struct expr *e = r->attr;
+    mir_size_t size = type_size (c2m_ctx, e->type);
+    mir_size_t align = var_align (c2m_ctx, e->type);
+
+    ns->size = round_size (ns->size, align);
+    e->c.u_val = ns->size;
+    ns->size += size;
+    ns->stack_var_p = TRUE;
+  }
+}
+
 static const char *check_attrs (c2m_ctx_t c2m_ctx, node_t r, decl_t decl, node_t attrs,
                                 int check_p) {
   node_t n, list, id, alias_id;
@@ -9869,6 +9891,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     curr_switch = curr_loop = curr_loop_switch = NULL;
     curr_call_arg_area_offset = 0;
     VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
+    VARR_TRUNC (node_t, func_stmtexprs_for_allocation, 0);
     create_decl (c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
     curr_scope = func_block_scope;
     check (c2m_ctx, declarations, r);
@@ -9954,6 +9977,7 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     assert (curr_scope == top_scope); /* set up in the block */
     func_block_scope = top_scope;
     process_func_decls_for_allocation (c2m_ctx);
+    process_func_stmtexprs_for_allocation (c2m_ctx, block);
     /* Add call arg area */
     ns = block->attr;
     ns->size = round_size (ns->size, MAX_ALIGNMENT);
@@ -10003,17 +10027,14 @@ static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
     e = create_expr (c2m_ctx, r);
     *e->type = *t1;
     /* Reserve a frame slot for struct/union results so that sibling statement-expressions get
-       independent storage without a dynamic ALLOCA (which would overflow the stack in a loop): */
-    if (func_block_scope != NULL && (t1->mode == TM_STRUCT || t1->mode == TM_UNION)) {
-      struct node_scope *fns = func_block_scope->attr;
-      mir_size_t size = type_size (c2m_ctx, t1);
-      mir_size_t align = var_align (c2m_ctx, t1);
-
-      fns->size = round_size (fns->size, align);
-      e->c.u_val = fns->size;
-      fns->size += size;
-      fns->stack_var_p = TRUE;
-    }
+       independent storage without a dynamic ALLOCA (which would overflow the stack in a loop).
+       The slot is assigned after the function's stack variables are laid out
+       (process_func_stmtexprs_for_allocation): the variables are placed from offset 0 only once
+       the whole body is checked, so a slot taken from the frame size here would overlap the
+       first stack variable -- a by-value struct parameter, say, which the statement
+       expression's copy-out then overwrote. */
+    if (func_block_scope != NULL && (t1->mode == TM_STRUCT || t1->mode == TM_UNION))
+      VARR_PUSH (node_t, func_stmtexprs_for_allocation, r);
     break;
   }
   case N_BLOCK:
@@ -10334,6 +10355,7 @@ static void context_init (c2m_ctx_t c2m_ctx) {
   curr_unnamed_anon_struct_union_member = NULL;
   HTAB_CREATE (case_t, case_tab, alloc, 100, case_hash, case_eq, NULL);
   VARR_CREATE (decl_t, func_decls_for_allocation, alloc, 1024);
+  VARR_CREATE (node_t, func_stmtexprs_for_allocation, alloc, 64);
   VARR_CREATE (node_t, possible_incomplete_decls, alloc, 512);
 }
 
@@ -10346,6 +10368,8 @@ static void context_finish (c2m_ctx_t c2m_ctx) {
   symbol_finish (c2m_ctx);
   if (case_tab != NULL) HTAB_DESTROY (case_t, case_tab);
   if (func_decls_for_allocation != NULL) VARR_DESTROY (decl_t, func_decls_for_allocation);
+  if (func_stmtexprs_for_allocation != NULL)
+    VARR_DESTROY (node_t, func_stmtexprs_for_allocation);
   if (possible_incomplete_decls != NULL) VARR_DESTROY (node_t, possible_incomplete_decls);
   free (c2m_ctx->check_ctx);
 }
